@@ -120,12 +120,14 @@ CORS_ALLOW_ALL_ORIGINS = False
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "https://panda-2-lupm.vercel.app",
 ]
 
 # 4. CSRF 신뢰 출처 (POST 요청 시 필수)
 CSRF_TRUSTED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "https://panda-2-lupm.vercel.app",
 ]
 
 # 5. DRF 인증 설정 (이게 없으면 Django가 로그인 여부를 모름)
