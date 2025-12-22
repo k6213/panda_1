@@ -1,23 +1,45 @@
 from django.contrib import admin
-from django.urls import path
+from django.urls import path, include
+from rest_framework.routers import DefaultRouter
 from sales import views
 
+# ==============================================================================
+# 🔄 Router 설정 (ViewSet 자동 연결)
+# ==============================================================================
+router = DefaultRouter()
+
+# 1. 상담사 관리
+router.register(r'agents', views.UserViewSet)
+
+# 2. 고객 관리 (핵심 로직)
+# basename='customer'는 get_queryset을 오버라이딩 했을 때 필수입니다.
+router.register(r'customers', views.CustomerViewSet, basename='customer')
+
+# 3. 설정 데이터 관리 (관리자용)
+router.register(r'platforms', views.PlatformViewSet)           # 통신사
+router.register(r'failure_reasons', views.FailureReasonViewSet) # 실패 사유
+router.register(r'custom_statuses', views.CustomStatusViewSet)  # 상담 상태
+
+# ⭐️ [신규] 정산 상태값 & 상품(요금제) 관리
+router.register(r'settlement_statuses', views.SettlementStatusViewSet)
+router.register(r'sales_products', views.SalesProductViewSet)
+
+# 4. 상담 로그
+router.register(r'logs', views.ConsultationLogViewSet)
+
+# ==============================================================================
+# 🔗 URL 패턴 정의
+# ==============================================================================
 urlpatterns = [
+    # 관리자 페이지
     path('admin/', admin.site.urls),
-    path('api/customers/', views.get_customers),
-    path('api/customers/<int:customer_id>/assign/', views.assign_customer),
+
+    # 로그인 (함수형 뷰)
     path('api/login/', views.login_api),
-    path('api/customers/<int:customer_id>/update/', views.update_customer),
-    path('api/customers/<int:customer_id>/add_log/', views.add_consultation_log),
-    path('api/customers/bulk_upload/', views.bulk_upload),
+
+    # 통계 (함수형 뷰)
     path('api/stats/', views.get_dashboard_stats),
-    path('api/agents/', views.manage_agents),
-    path('api/agents/<int:agent_id>/', views.delete_agent),
-    path('api/platforms/', views.manage_platforms),
-    path('api/platforms/<int:platform_id>/', views.manage_platforms),
-    path('api/failure_reasons/', views.manage_failure_reasons),
-    path('api/failure_reasons/<int:reason_id>/', views.manage_failure_reasons),
-    path('api/my_stats/', views.get_my_stats),
-    path('api/platforms/apply_all/', views.apply_platform_costs),
-    path('api/customers/allocate/', views.allocate_customers),
+    
+    # Router가 만든 API 주소들 일괄 등록 (/api/...)
+    path('api/', include(router.urls)),
 ]
