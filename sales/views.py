@@ -1,11 +1,18 @@
+import os
+import json
 import datetime
+import re
+import firebase_admin
+from firebase_admin import credentials, messaging
 from django.utils import timezone
 from django.contrib.auth import authenticate
 from django.db.models import Sum, Q
-from django.views.decorators.csrf import csrf_exempt
+from django.shortcuts import get_object_or_404
+from django.http import HttpResponse
 
 # DRF 관련 임포트
-from rest_framework import viewsets, permissions, status
+from rest_framework import viewsets, status
+from rest_framework.views import APIView
 from rest_framework.decorators import api_view, permission_classes, action
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -14,7 +21,7 @@ from rest_framework.authtoken.models import Token
 # 모델 및 시리얼라이저 임포트
 from .models import (
     Customer, User, ConsultationLog, Platform, 
-    FailureReason, CustomStatus, SettlementStatus, SalesProduct
+    FailureReason, CustomStatus, SettlementStatus, SalesProduct, SMSLog
 )
 from .serializers import (
     CustomerSerializer, UserSerializer, PlatformSerializer, 
@@ -23,8 +30,45 @@ from .serializers import (
 )
 
 # ==============================================================================
-# 1. 인증 (로그인)
+# 🔥 Firebase Admin SDK 초기화 (환경 변수 또는 로컬 파일 대응)
 # ==============================================================================
+if not firebase_admin._apps:
+    try:
+        # 1. Render 환경 변수(FIREBASE_CONFIG) 확인
+        fb_config_str = os.environ.get('FIREBASE_CONFIG')
+        if fb_config_str:
+            fb_config = json.loads(fb_config_str)
+            cred = credentials.Certificate(fb_config)
+            print("✅ Firebase: 환경 변수(FIREBASE_CONFIG)로 초기화 성공")
+        # 2. 로컬 파일 확인
+        elif os.path.exists("serviceAccountKey.json"):
+            cred = credentials.Certificate("serviceAccountKey.json")
+            print("🏠 Firebase: 로컬 파일로 초기화 성공")
+        else:
+            print("⚠️ Firebase: 인증 정보를 찾을 수 없습니다. SMS 발송이 제한됩니다.")
+            cred = None
+            
+        if cred:
+            firebase_admin.initialize_app(cred)
+    except Exception as e:
+        print(f"❌ Firebase 초기화 에러: {str(e)}")
+
+# ==============================================================================
+# [유틸리티] 전화번호 정규화 (국가코드 제거 및 숫자만 추출)
+# ==============================================================================
+def clean_phone(phone):
+    if not phone: return ""
+    # 숫자만 추출
+    cleaned = re.sub(r'[^0-9]', '', str(phone))
+    # 국가코드 82 제거 및 010 형태로 통일
+    if cleaned.startswith('82'):
+        cleaned = '0' + cleaned[2:]
+    return cleaned
+
+# ==============================================================================
+# 1. 인증 및 기기 연결
+# ==============================================================================
+
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def login_api(request):
@@ -39,14 +83,152 @@ def login_api(request):
             'token': token.key,
             'user_id': user.id, 
             'username': user.username, 
-            'role': user.role
+            'role': user.role,
+            'fcm_token': user.fcm_token
         })
-    else:
-        return Response({'message': '정보가 틀립니다.'}, status=400)
+    return Response({'message': 'ID 또는 비밀번호가 틀립니다.'}, status=400)
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def update_fcm_token_view(request):
+    """ 상담사의 핸드폰 FCM 토큰을 서버에 등록 (기기 연결) """
+    fcm_token = request.data.get('fcm_token')
+    if not fcm_token:
+        return Response({'message': '토큰값이 없습니다.'}, status=400)
+    
+    user = request.user
+    user.fcm_token = fcm_token
+    user.save()
+    
+    return Response({
+        'status': 'success',
+        'message': '📱 기기 연동 완료!',
+        'agent': user.username
+    })
 
 # ==============================================================================
-# 2. 사용자(상담사) 관리 ViewSet
+# 2. 🔥 SMS 양방향 연동 (카카오톡 스타일 채팅 구현의 핵심)
 # ==============================================================================
+
+class SMSReceiveView(APIView):
+    """ 고객이 보낸 문자를 수신 (Traccar 게이트웨이 앱의 Webhook) """
+    permission_classes = [AllowAny] 
+
+    def post(self, request):
+        from_num = clean_phone(request.data.get('from', ''))
+        msg_content = request.data.get('message', '')
+
+        if not from_num or not msg_content:
+            return Response({"message": "데이터 부족"}, status=400)
+
+        # 번호 매칭 (뒤 8자리 비교가 가장 정확함)
+        search_num = from_num[-8:]
+        customer = Customer.objects.filter(phone__contains=search_num).first()
+
+        if customer:
+            # 수신 로그 기록 (방향: IN)
+            SMSLog.objects.create(
+                customer=customer, 
+                agent=customer.owner, # 담당 상담사 매칭
+                content=msg_content, 
+                direction='IN', 
+                status='RECEIVED'
+            )
+            # 수신 시 상담 상태를 '재통'으로 자동 변경하여 알림 효과 부여 (선택 사항)
+            if customer.status == '부재':
+                customer.status = '재통'
+                customer.save()
+
+            return Response({"status": "success"}, status=200)
+        
+        return Response({"status": "ignored", "message": "등록되지 않은 고객 번호"}, status=200)
+
+
+
+class LeadCaptureView(APIView):
+    """ 
+    [홍보링크 발송 & 랜딩페이지 수집] 
+    상담사가 신규 번호에 링크를 쏠 때와 고객이 직접 신청할 때 모두 사용
+    """
+    permission_classes = [AllowAny] 
+
+    def post(self, request):
+        phone = clean_phone(request.data.get('phone', ''))
+        agent_id = request.data.get('agent_id')
+        name = request.data.get('name', '신규문의')
+        custom_message = request.data.get('message') # 프론트에서 보낸 홍보문구
+
+        if not phone or not agent_id:
+            return Response({"message": "필수 정보(번호/상담사)가 없습니다."}, status=400)
+
+        agent = get_object_or_404(User, id=agent_id)
+        
+        # 1. 고객 등록 또는 기존 데이터 확보
+        customer, created = Customer.objects.get_or_create(
+            phone=phone,
+            defaults={'name': name, 'owner': agent, 'status': '미통건'}
+        )
+
+        # 2. 발송할 텍스트 결정
+        sms_text = custom_message if custom_message else f"[상담신청] {name}님 정보가 접수되었습니다."
+
+        # 3. 발송 로그 생성 (방향: OUT)
+        log = SMSLog.objects.create(
+            customer=customer, agent=agent, content=sms_text, direction='OUT', status='PENDING'
+        )
+
+        # 4. 안드로이드 기기로 FCM 발송 명령 전달
+        if agent.fcm_token:
+            try:
+                message = messaging.Message(
+                    data={'to': phone, 'message': sms_text},
+                    token=agent.fcm_token,
+                )
+                messaging.send(message)
+                log.status = 'SUCCESS'; log.save()
+                return Response({
+                    "message": "발송 명령 완료", 
+                    "customer_id": customer.id, 
+                    "is_new": created
+                }, status=201)
+            except Exception as e:
+                log.status = f'FAIL: {str(e)}'; log.save()
+                return Response({"message": "기기 전송 실패", "customer_id": customer.id}, status=201)
+        
+        return Response({"message": "접수완료(기기 미연결)", "customer_id": customer.id}, status=201)
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def send_manual_sms(request):
+    """ 채팅창 하단 입력칸에서 상담사가 직접 문자를 보낼 때 실행 """
+    customer_id = request.data.get('customer_id')
+    sms_text = request.data.get('message')
+    agent = request.user
+    customer = get_object_or_404(Customer, id=customer_id)
+
+    if not agent.fcm_token:
+        return Response({'message': '연결된 안드로이드 기기가 없습니다.'}, status=400)
+
+    try:
+        # FCM 전송
+        message = messaging.Message(
+            data={'to': clean_phone(customer.phone), 'message': sms_text},
+            token=agent.fcm_token,
+        )
+        messaging.send(message)
+        
+        # 발송 성공 로그 저장
+        SMSLog.objects.create(
+            customer=customer, agent=agent, content=sms_text, direction='OUT', status='SUCCESS'
+        )
+        return Response({"message": "전송 성공"})
+    except Exception as e:
+        return Response({"message": f"발송 에러: {str(e)}"}, status=500)
+
+# ==============================================================================
+# 3. 모델 기반 CRUD ViewSets
+# ==============================================================================
+
 class UserViewSet(viewsets.ModelViewSet):
     queryset = User.objects.filter(role='AGENT').order_by('-date_joined')
     serializer_class = UserSerializer
@@ -56,278 +238,92 @@ class UserViewSet(viewsets.ModelViewSet):
         username = request.data.get('username')
         password = request.data.get('password')
         if User.objects.filter(username=username).exists():
-            return Response({'message': '중복 ID'}, status=400)
+            return Response({'message': '중복된 아이디입니다.'}, status=400)
         User.objects.create_user(username=username, password=password, role='AGENT')
-        return Response({'message': '등록 완료'}, status=201)
+        return Response({'message': '상담사 등록 완료'}, status=201)
 
-# ==============================================================================
-# 3. 설정 데이터 관리 ViewSet
-# ==============================================================================
-
-# (1) 플랫폼(통신사) 관리
-class PlatformViewSet(viewsets.ModelViewSet):
-    queryset = Platform.objects.all()
-    serializer_class = PlatformSerializer
-    permission_classes = [IsAuthenticated]
-
-    @action(detail=False, methods=['post'])
-    def apply_all(self, request):
-        """변경된 단가를 기존 DB에 일괄 적용"""
-        for p in Platform.objects.all():
-            Customer.objects.filter(platform=p.name, ad_cost=0).update(ad_cost=p.cost)
-        return Response({'message': '단가 일괄 적용 완료'})
-
-# (2) 실패 사유 관리
-class FailureReasonViewSet(viewsets.ModelViewSet):
-    queryset = FailureReason.objects.all()
-    serializer_class = ReasonSerializer
-    permission_classes = [IsAuthenticated]
-
-# (3) 상담 상태값 관리
-class CustomStatusViewSet(viewsets.ModelViewSet):
-    queryset = CustomStatus.objects.all()
-    serializer_class = StatusSerializer
-    permission_classes = [IsAuthenticated]
-
-# (4) 정산 상태값 관리
-class SettlementStatusViewSet(viewsets.ModelViewSet):
-    queryset = SettlementStatus.objects.all().order_by('created_at')
-    serializer_class = SettlementStatusSerializer
-    permission_classes = [IsAuthenticated]
-
-# (5) 상품/요금제 관리
-class SalesProductViewSet(viewsets.ModelViewSet):
-    queryset = SalesProduct.objects.all().order_by('category', 'name')
-    serializer_class = SalesProductSerializer
-    permission_classes = [IsAuthenticated]
-
-# ==============================================================================
-# 4. 상담 로그 관리
-# ==============================================================================
-class ConsultationLogViewSet(viewsets.ModelViewSet):
-    queryset = ConsultationLog.objects.all()
-    serializer_class = LogSerializer
-    permission_classes = [IsAuthenticated]
-
-# ==============================================================================
-# 5. 고객(Customer) 관리
-# ==============================================================================
 class CustomerViewSet(viewsets.ModelViewSet):
     serializer_class = CustomerSerializer
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
         user = self.request.user
+        # 관리자는 전체 DB, 상담사는 본인 담당 + 공유(미배정) DB만 조회
         if user.role == 'ADMIN':
             return Customer.objects.all().order_by('-upload_date', '-created_at')
-        else:
-            return (Customer.objects.filter(owner=user) | Customer.objects.filter(owner=None)).order_by('-upload_date', '-created_at')
+        return Customer.objects.filter(Q(owner=user) | Q(owner__isnull=True)).order_by('-upload_date', '-created_at')
+
+    @action(detail=True, methods=['post'])
+    def add_log(self, request, pk=None):
+        customer = self.get_object()
+        ConsultationLog.objects.create(customer=customer, writer=request.user, content=request.data.get('content'))
+        return Response({'status': 'success'})
 
     @action(detail=True, methods=['post'])
     def assign(self, request, pk=None):
         customer = self.get_object()
-        user_id = request.data.get('user_id')
-        if not user_id:
-            return Response({'message': '상담사 ID가 필요합니다.'}, status=400)
-        try:
-            user = User.objects.get(pk=user_id)
-            customer.owner = user
-            customer.status = '재통'
-            customer.save()
-            return Response({'message': f'{user.username}님에게 배정되었습니다.'})
-        except User.DoesNotExist:
-            return Response({'message': '존재하지 않는 상담사입니다.'}, status=404)
-
-    @action(detail=False, methods=['post'])
-    def allocate(self, request):
-        customer_ids = request.data.get('customer_ids', [])
-        agent_id = request.data.get('agent_id')
-        if not customer_ids or not agent_id:
-            return Response({'message': '대상과 상담사를 선택해주세요.'}, status=400)
-        try:
-            agent = User.objects.get(id=agent_id)
-            updated_count = Customer.objects.filter(id__in=customer_ids).update(owner=agent)
-            return Response({'message': f'{updated_count}건 일괄 배정 완료'})
-        except:
-            return Response({'message': '배정 실패'}, status=500)
-
-    @action(detail=True, methods=['post'])
-    def handle_as(self, request, pk=None):
-        customer = self.get_object()
-        action = request.data.get('action')
-        if action == 'approve':
-            customer.is_as_approved = True
-            customer.status = 'AS승인'
-            customer.as_reason = f"[승인] {customer.as_reason}"
-        else:
-            customer.is_as_approved = False
-            customer.status = '미통건'
-            customer.as_reason = f"[반려] {customer.as_reason}"
+        customer.owner = request.user
+        customer.status = '재통'
         customer.save()
-        return Response({'message': '처리 완료'})
+        return Response({'message': '내 담당으로 배정되었습니다.'})
 
     @action(detail=False, methods=['post'])
     def bulk_upload(self, request):
-        if getattr(request.user, 'role', None) != 'ADMIN' and not request.user.is_superuser:
-            return Response({'message': '관리자 권한이 필요합니다.'}, status=403)
-
         data_list = request.data.get('customers', [])
         success = 0
-        errors = 0
-        p_map = {p.name: p.cost for p in Platform.objects.all()}
-
         for item in data_list:
-            try:
-                phone = str(item.get('phone', '')).strip()
-                if not phone: continue
-                name = str(item.get('name', '이름없음')).strip()
-                p_name = str(item.get('platform', '기타')).strip()
-                
-                raw_policy = item.get('policy', 0)
-                agent_policy_val = int(raw_policy) if raw_policy else 0
-                raw_cost = item.get('ad_cost', 0)
-                final_cost = int(raw_cost) if raw_cost else p_map.get(p_name, 0)
-                
-                Customer.objects.create(
-                    phone=phone, name=name, platform=p_name,
-                    last_memo=item.get('last_memo', ''),
-                    ad_cost=final_cost,
-                    agent_policy=agent_policy_val,
-                    policy_amt=0,
-                    upload_date=datetime.date.today(),
-                    status='미통건',
-                    owner=None,
-                    settlement_status='미정산'
-                )
-                success += 1
-            except Exception as e:
-                print(f"업로드 에러: {e}")
-                errors += 1
-        return Response({'message': f'성공 {success}건 / 실패 {errors}건', 'success': success})
-
-    def update(self, request, *args, **kwargs):
-        kwargs['partial'] = True
-        return super().update(request, *args, **kwargs)
-
+            phone = clean_phone(item.get('phone', ''))
+            if not phone: continue
+            Customer.objects.create(
+                phone=phone, 
+                name=item.get('name', '이름없음'), 
+                platform=item.get('platform', '기타'), 
+                upload_date=datetime.date.today(), 
+                status='미통건'
+            )
+            success += 1
+        return Response({'message': f'총 {success}건 등록 완료', 'count': success})
 
 # ==============================================================================
-# 6. 통계 API (대시보드용) - ⭐️ [순수익 계산식 수정 완료]
+# 4. 통계 및 마스터 데이터 관리
 # ==============================================================================
+
+class PlatformViewSet(viewsets.ModelViewSet):
+    queryset = Platform.objects.all(); serializer_class = PlatformSerializer; permission_classes = [IsAuthenticated]
+class FailureReasonViewSet(viewsets.ModelViewSet):
+    queryset = FailureReason.objects.all(); serializer_class = ReasonSerializer; permission_classes = [IsAuthenticated]
+class CustomStatusViewSet(viewsets.ModelViewSet):
+    queryset = CustomStatus.objects.all(); serializer_class = StatusSerializer; permission_classes = [IsAuthenticated]
+class SettlementStatusViewSet(viewsets.ModelViewSet):
+    queryset = SettlementStatus.objects.all(); serializer_class = SettlementStatusSerializer; permission_classes = [IsAuthenticated]
+class SalesProductViewSet(viewsets.ModelViewSet):
+    queryset = SalesProduct.objects.all(); serializer_class = SalesProductSerializer; permission_classes = [IsAuthenticated]
+class ConsultationLogViewSet(viewsets.ModelViewSet):
+    queryset = ConsultationLog.objects.all(); serializer_class = LogSerializer; permission_classes = [IsAuthenticated]
+
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def get_dashboard_stats(request):
     period = request.query_params.get('period', 'month')
     user_id = request.query_params.get('user_id')
-    
     today = timezone.now().date()
-    start_date = today
-    end_date = today
-
-    if period == 'today':
-        start_date = today
-    elif period == 'week':
-        start_date = today - datetime.timedelta(days=today.weekday())
-    elif period == 'month':
-        start_date = today.replace(day=1)
-    elif period == 'all':
-        start_date = datetime.date(2000, 1, 1)
     
-    query = Q(upload_date__gte=start_date) & Q(upload_date__lte=end_date)
-    if user_id:
-        query &= Q(owner_id=user_id)
-        
-    target_customers = Customer.objects.filter(query)
-
-    total_db = target_customers.count()
+    # 통계 기간 설정
+    start_date = today.replace(day=1) if period == 'month' else today
+    query = Q(upload_date__gte=start_date)
     
-    success_status = ['접수완료', '설치완료', '해지진행']
-    revenue_status = ['접수완료', '설치완료'] # 수익 계산 대상
-    cancel_status = ['접수취소', '해지진행']
+    if user_id == 'mine': query &= Q(owner=request.user)
+    elif user_id and user_id != 'ALL': query &= Q(owner_id=user_id)
     
-    accept_count = target_customers.filter(status__in=success_status).count()
-    accept_rate = round((accept_count / total_db * 100), 1) if total_db > 0 else 0
+    target = Customer.objects.filter(query)
+    revenue_status = ['접수완료', '설치완료']
     
-    # 설치 매출
-    installed_qs = target_customers.filter(status='설치완료')
-    installed_revenue = sum([c.policy_amt * 10000 for c in installed_qs])
-
-    # ⭐️ [핵심 수정] 예상 순수익 (본사정책 - 지원금)
-    revenue_qs = target_customers.filter(status__in=revenue_status)
-    net_profit = 0
-    for c in revenue_qs:
-        policy = c.policy_amt or 0
-        support = c.support_amt or 0
-        
-        # 기존: (support - policy) -> 역순이라 음수 발생
-        # 수정: (policy - support) -> 정상 (70 - 20 = 50)
-        margin = (policy - support) * 10000
-        net_profit += margin
-
-    total_ad_cost = target_customers.aggregate(Sum('ad_cost'))['ad_cost__sum'] or 0
-    final_profit = net_profit - total_ad_cost
-
-    cancel_count = target_customers.filter(status__in=cancel_status).count()
-    install_count = installed_qs.count()
-    total_try = accept_count + cancel_count
-    cancel_rate = round((cancel_count / total_try * 100), 1) if total_try > 0 else 0
-    install_rate = round((install_count / total_try * 100), 1) if total_try > 0 else 0
-
-    # 플랫폼 통계
-    platform_stats = []
-    platforms = target_customers.values_list('platform', flat=True).distinct()
-    for p_name in platforms:
-        if not p_name: continue
-        p_qs = target_customers.filter(platform=p_name)
-        p_count = p_qs.count()
-        p_success = p_qs.filter(status__in=success_status).count()
-        p_rate = round((p_success / p_count * 100), 1) if p_count > 0 else 0
-        p_ad_cost = p_qs.aggregate(Sum('ad_cost'))['ad_cost__sum'] or 0
-        
-        p_margin = 0
-        for c in p_qs.filter(status__in=revenue_status):
-            pol = c.policy_amt or 0
-            sup = c.support_amt or 0
-            p_margin += (pol - sup) * 10000 # 여기도 동일하게 수정
-            
-        platform_stats.append({
-            'platform': p_name, 'count': p_count, 'success': p_success, 'rate': p_rate,
-            'adCost': p_ad_cost, 'margin': p_margin
-        })
-
-    # 상담사 랭킹
-    team_stats = []
-    agents = User.objects.filter(role='AGENT')
-    for agent in agents:
-        a_qs = target_customers.filter(owner=agent)
-        if not a_qs.exists(): continue
-        a_total = a_qs.count()
-        a_success = a_qs.filter(status__in=success_status).count()
-        a_rate = round((a_success / a_total * 100), 1) if a_total > 0 else 0
-        a_revenue = 0
-        for c in a_qs.filter(status__in=revenue_status):
-            pol = c.policy_amt or 0
-            sup = c.support_amt or 0
-            a_revenue += (pol - sup) * 10000 # 여기도 동일하게 수정
-            
-        team_stats.append({
-            'id': agent.id, 'name': agent.username, 'total': a_total,
-            'success': a_success, 'rate': a_rate, 'revenue': a_revenue
-        })
-    
-    team_stats.sort(key=lambda x: x['revenue'], reverse=True)
+    # 수익 계산 (단위: 원)
+    net_profit = sum((int(c.agent_policy or 0) - int(c.support_amt or 0)) * 10000 for c in target.filter(status__in=revenue_status))
 
     return Response({
-        'period': period,
-        'month': today.month,
-        'total_db': total_db,
-        'accept_count': accept_count,
-        'accept_rate': accept_rate,
-        'installed_revenue': installed_revenue,
+        'total_db': target.count(),
+        'accept_count': target.filter(status__in=revenue_status).count(),
         'net_profit': net_profit,
-        'total_ad_cost': total_ad_cost,
-        'final_profit': final_profit,
-        'cancel_rate': cancel_rate,
-        'install_rate': install_rate,
-        'platform_stats': platform_stats,
-        'team_stats': team_stats
+        'period': period
     })
