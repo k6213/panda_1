@@ -2,8 +2,7 @@ import os
 import json
 import datetime
 import re
-import firebase_admin
-from firebase_admin import credentials, messaging
+import requests  # 🔥 Firebase 대신 HTTP 요청을 위해 추가
 from django.utils import timezone
 from django.contrib.auth import authenticate
 from django.db.models import Sum, Q
@@ -30,37 +29,48 @@ from .serializers import (
 )
 
 # ==============================================================================
-# 🔥 Firebase Admin SDK 초기화 (환경 변수 또는 로컬 파일 대응)
+# [유틸리티] Traccar 클라우드 API 발송 함수
 # ==============================================================================
-if not firebase_admin._apps:
-    try:
-        # 1. Render 환경 변수(FIREBASE_CONFIG) 확인
-        fb_config_str = os.environ.get('FIREBASE_CONFIG')
-        if fb_config_str:
-            fb_config = json.loads(fb_config_str)
-            cred = credentials.Certificate(fb_config)
-            print("✅ Firebase: 환경 변수(FIREBASE_CONFIG)로 초기화 성공")
-        # 2. 로컬 파일 확인
-        elif os.path.exists("serviceAccountKey.json"):
-            cred = credentials.Certificate("serviceAccountKey.json")
-            print("🏠 Firebase: 로컬 파일로 초기화 성공")
-        else:
-            print("⚠️ Firebase: 인증 정보를 찾을 수 없습니다. SMS 발송이 제한됩니다.")
-            cred = None
-            
-        if cred:
-            firebase_admin.initialize_app(cred)
-    except Exception as e:
-        print(f"❌ Firebase 초기화 에러: {str(e)}")
+def send_traccar_cloud_sms(phone, sms_text):
+    """
+    Traccar 공식 클라우드 서버를 통해 안드로이드 기기로 발송 명령을 전달합니다.
+    """
+    url = "https://www.traccar.org/sms/"  # 파워쉘에서 성공한 주소
+    
+    # 사진에서 확인된 사용자님의 클라우드 토큰
+    # 보안을 위해 실제 배포 시에는 os.environ.get('TRACCAR_TOKEN') 사용을 권장합니다.
+    cloud_token = "eb8CCImGSFe3AEUIUkobAZ:APA91bEwtQEoN2nuqw8iBKY9jYc4KLbc1_pFny56kVGPcCB8jUbR-XBqXcLY2MXK_FVW7QyCHBvhnQ7RYNrh5WV037HOuczDvej2aBgsobpuKR2P0w-_wnA"
 
-# ==============================================================================
-# [유틸리티] 전화번호 정규화 (국가코드 제거 및 숫자만 추출)
-# ==============================================================================
+    headers = {
+        "Authorization": cloud_token,
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "to": phone,
+        "message": sms_text
+    }
+
+    try:
+        # POST 요청을 통해 Traccar 중계 서버로 전달
+        response = requests.post(url, json=payload, headers=headers, timeout=10)
+        
+        # 응답 확인 (파워쉘 결과와 동일하게 successCount가 포함된 JSON 반환)
+        if response.status_code == 200:
+            result = response.json()
+            if result.get('successCount', 0) > 0:
+                print(f"✅ SMS 발송 요청 성공: {phone}")
+                return True
+        print(f"⚠️ SMS 서버 응답 오류: {response.status_code} - {response.text}")
+        return False
+    except Exception as e:
+        print(f"❌ SMS API 호출 실패: {str(e)}")
+        return False
+
+# [유틸리티] 전화번호 정규화
 def clean_phone(phone):
     if not phone: return ""
-    # 숫자만 추출
     cleaned = re.sub(r'[^0-9]', '', str(phone))
-    # 국가코드 82 제거 및 010 형태로 통일
     if cleaned.startswith('82'):
         cleaned = '0' + cleaned[2:]
     return cleaned
@@ -107,7 +117,7 @@ def update_fcm_token_view(request):
     })
 
 # ==============================================================================
-# 2. 🔥 SMS 양방향 연동 (카카오톡 스타일 채팅 구현의 핵심)
+# 2. 🔥 SMS 양방향 연동 (Traccar API 적용 버전)
 # ==============================================================================
 
 class SMSReceiveView(APIView):
@@ -121,81 +131,61 @@ class SMSReceiveView(APIView):
         if not from_num or not msg_content:
             return Response({"message": "데이터 부족"}, status=400)
 
-        # 번호 매칭 (뒤 8자리 비교가 가장 정확함)
         search_num = from_num[-8:]
         customer = Customer.objects.filter(phone__contains=search_num).first()
 
         if customer:
-            # 수신 로그 기록 (방향: IN)
             SMSLog.objects.create(
                 customer=customer, 
-                agent=customer.owner, # 담당 상담사 매칭
+                agent=customer.owner, 
                 content=msg_content, 
                 direction='IN', 
                 status='RECEIVED'
             )
-            # 수신 시 상담 상태를 '재통'으로 자동 변경하여 알림 효과 부여 (선택 사항)
             if customer.status == '부재':
                 customer.status = '재통'
                 customer.save()
-
             return Response({"status": "success"}, status=200)
         
         return Response({"status": "ignored", "message": "등록되지 않은 고객 번호"}, status=200)
 
 
-
 class LeadCaptureView(APIView):
-    """ 
-    [홍보링크 발송 & 랜딩페이지 수집] 
-    상담사가 신규 번호에 링크를 쏠 때와 고객이 직접 신청할 때 모두 사용
-    """
+    """ [홍보링크 발송 & 랜딩페이지 수집] """
     permission_classes = [AllowAny] 
 
     def post(self, request):
         phone = clean_phone(request.data.get('phone', ''))
         agent_id = request.data.get('agent_id')
         name = request.data.get('name', '신규문의')
-        custom_message = request.data.get('message') # 프론트에서 보낸 홍보문구
+        custom_message = request.data.get('message')
 
         if not phone or not agent_id:
             return Response({"message": "필수 정보(번호/상담사)가 없습니다."}, status=400)
 
         agent = get_object_or_404(User, id=agent_id)
-        
-        # 1. 고객 등록 또는 기존 데이터 확보
         customer, created = Customer.objects.get_or_create(
             phone=phone,
             defaults={'name': name, 'owner': agent, 'status': '미통건'}
         )
 
-        # 2. 발송할 텍스트 결정
         sms_text = custom_message if custom_message else f"[상담신청] {name}님 정보가 접수되었습니다."
 
-        # 3. 발송 로그 생성 (방향: OUT)
+        # 발송 로그 생성
         log = SMSLog.objects.create(
             customer=customer, agent=agent, content=sms_text, direction='OUT', status='PENDING'
         )
 
-        # 4. 안드로이드 기기로 FCM 발송 명령 전달
-        if agent.fcm_token:
-            try:
-                message = messaging.Message(
-                    data={'to': phone, 'message': sms_text},
-                    token=agent.fcm_token,
-                )
-                messaging.send(message)
-                log.status = 'SUCCESS'; log.save()
-                return Response({
-                    "message": "발송 명령 완료", 
-                    "customer_id": customer.id, 
-                    "is_new": created
-                }, status=201)
-            except Exception as e:
-                log.status = f'FAIL: {str(e)}'; log.save()
-                return Response({"message": "기기 전송 실패", "customer_id": customer.id}, status=201)
-        
-        return Response({"message": "접수완료(기기 미연결)", "customer_id": customer.id}, status=201)
+        # 🔥 수정됨: Firebase 직접 전송 대신 Traccar Cloud API 호출
+        if send_traccar_cloud_sms(phone, sms_text):
+            log.status = 'SUCCESS'
+            log.save()
+            return Response({"message": "발송 명령 완료", "customer_id": customer.id}, status=201)
+        else:
+            log.status = 'FAIL'
+            log.save()
+            return Response({"message": "기기 전송 실패(Traccar 서버 응답 없음)"}, status=201)
+
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
@@ -206,27 +196,17 @@ def send_manual_sms(request):
     agent = request.user
     customer = get_object_or_404(Customer, id=customer_id)
 
-    if not agent.fcm_token:
-        return Response({'message': '연결된 안드로이드 기기가 없습니다.'}, status=400)
-
-    try:
-        # FCM 전송
-        message = messaging.Message(
-            data={'to': clean_phone(customer.phone), 'message': sms_text},
-            token=agent.fcm_token,
-        )
-        messaging.send(message)
-        
-        # 발송 성공 로그 저장
+    # 🔥 수정됨: Traccar Cloud API 호출
+    if send_traccar_cloud_sms(clean_phone(customer.phone), sms_text):
         SMSLog.objects.create(
             customer=customer, agent=agent, content=sms_text, direction='OUT', status='SUCCESS'
         )
         return Response({"message": "전송 성공"})
-    except Exception as e:
-        return Response({"message": f"발송 에러: {str(e)}"}, status=500)
+    else:
+        return Response({"message": "발송 에러: Traccar 서버에 도달할 수 없습니다."}, status=500)
 
 # ==============================================================================
-# 3. 모델 기반 CRUD ViewSets
+# 3. 모델 기반 CRUD ViewSets (기존 로직 유지)
 # ==============================================================================
 
 class UserViewSet(viewsets.ModelViewSet):
@@ -248,7 +228,6 @@ class CustomerViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        # 관리자는 전체 DB, 상담사는 본인 담당 + 공유(미배정) DB만 조회
         if user.role == 'ADMIN':
             return Customer.objects.all().order_by('-upload_date', '-created_at')
         return Customer.objects.filter(Q(owner=user) | Q(owner__isnull=True)).order_by('-upload_date', '-created_at')
@@ -285,7 +264,7 @@ class CustomerViewSet(viewsets.ModelViewSet):
         return Response({'message': f'총 {success}건 등록 완료', 'count': success})
 
 # ==============================================================================
-# 4. 통계 및 마스터 데이터 관리
+# 4. 마스터 데이터 및 통계 관리 (기존 로직 유지)
 # ==============================================================================
 
 class PlatformViewSet(viewsets.ModelViewSet):
@@ -308,7 +287,6 @@ def get_dashboard_stats(request):
     user_id = request.query_params.get('user_id')
     today = timezone.now().date()
     
-    # 통계 기간 설정
     start_date = today.replace(day=1) if period == 'month' else today
     query = Q(upload_date__gte=start_date)
     
@@ -318,7 +296,6 @@ def get_dashboard_stats(request):
     target = Customer.objects.filter(query)
     revenue_status = ['접수완료', '설치완료']
     
-    # 수익 계산 (단위: 원)
     net_profit = sum((int(c.agent_policy or 0) - int(c.support_amt or 0)) * 10000 for c in target.filter(status__in=revenue_status))
 
     return Response({
