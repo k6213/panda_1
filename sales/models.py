@@ -118,3 +118,21 @@ class SMSLog(models.Model):
 
     def __str__(self):
         return f"[{self.get_direction_display()}] {self.customer.name}: {self.content[:20]}"
+
+
+# ⭐️ [추가] 광고 채널 관리 (이름, 단가)
+class AdChannel(models.Model):
+    name = models.CharField(max_length=50, unique=True)
+    cost = models.IntegerField(default=0)  # 단가
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return self.name
+
+# ⭐️ [추가] 은행 목록 관리
+class Bank(models.Model):
+    name = models.CharField(max_length=50, unique=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return self.name

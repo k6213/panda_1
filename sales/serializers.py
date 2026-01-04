@@ -2,7 +2,7 @@ from rest_framework import serializers
 from .models import (
     Customer, User, ConsultationLog, 
     Platform, FailureReason, CustomStatus, 
-    SettlementStatus, SalesProduct # ⭐️ 신규 모델 임포트
+    SettlementStatus, SalesProduct, AdChannel, Bank # ⭐️ 신규 모델 임포트
 )
 
 # ==============================================================================
@@ -100,3 +100,15 @@ class CustomerSerializer(serializers.ModelSerializer):
         # return (policy - support) * 10000 - ad_cost
         
         return (policy - support) * 10000
+
+
+class AdChannelSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AdChannel
+        fields = '__all__'
+
+# ⭐️ [추가] 은행 시리얼라이저
+class BankSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Bank
+        fields = '__all__'
