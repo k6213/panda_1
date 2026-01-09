@@ -15,7 +15,7 @@ ALLOWED_HOSTS = [
     'localhost', 
     '127.0.0.1', 
     'panda-1-hd18.onrender.com', 
-    '*' # 초기 테스트 후에는 주소들을 구체화하는 것이 좋습니다.
+    '*' 
 ]
 
 # 3. 애플리케이션 정의
@@ -46,7 +46,7 @@ MIDDLEWARE = [
 ]
 
 ROOT_URLCONF = 'crm_system.urls'
-WSGI_APPLICATION = 'crm_system.wsgi.application' # 👈 이 줄이 꼭 있어야 배포가 됩니다!
+WSGI_APPLICATION = 'crm_system.wsgi.application'
 
 # 템플릿 설정 (관리자 페이지용)
 TEMPLATES = [
@@ -77,12 +77,16 @@ DATABASES = {
 LANGUAGE_CODE = 'ko-kr'
 TIME_ZONE = 'Asia/Seoul'
 USE_I18N = True
-USE_TZ = False # 한국 시간 기준으로 DB 저장
+USE_TZ = False 
 
-# 8. 정적 파일 설정
+# 8. 정적 파일 및 미디어 파일 설정
 STATIC_URL = 'static/'
 STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
 STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
+
+# ⭐️ [신규] 미디어(이미지 업로드) 설정 추가
+MEDIA_URL = '/media/'
+MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 
 AUTH_USER_MODEL = 'sales.User'
 

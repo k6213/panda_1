@@ -12,7 +12,7 @@ class User(AbstractUser):
     )
     role = models.CharField(max_length=10, choices=ROLE_CHOICES, default='AGENT', verbose_name="역할")
     
-    # ⭐️ 안드로이드 중계기 앱의 FCM 토큰 (핸드폰 식별자)
+    # 안드로이드 중계기 앱의 FCM 토큰 (핸드폰 식별자)
     fcm_token = models.TextField(null=True, blank=True, verbose_name="안드로이드 FCM 토큰")
 
     def __str__(self):
@@ -48,7 +48,7 @@ class SettlementStatus(models.Model):
     def __str__(self): return self.status
 
 # ==============================================================================
-# 3. 고객(DB) 모델
+# 3. 고객(DB) 모델 - ⭐️ 수정됨 (확인 요청 필드 추가)
 # ==============================================================================
 class Customer(models.Model):
     phone = models.CharField(max_length=20, verbose_name="전화번호 (고유값)")
@@ -77,11 +77,25 @@ class Customer(models.Model):
     detail_reason = models.CharField(max_length=100, blank=True, null=True)
     checklist = models.CharField(max_length=200, blank=True, default="")
 
+    # ⬇️ [핵심 추가] 관리자 확인 요청 기능용 필드
+    request_status = models.CharField(
+        max_length=20, 
+        null=True, 
+        blank=True, 
+        default=None,
+        help_text="REQUESTED(요청됨), PROCESSING(처리중), COMPLETED(완료)"
+    )
+    request_message = models.TextField(
+        null=True, 
+        blank=True, 
+        help_text="관리자가 보낸 확인 요청 메시지"
+    )
+
     def __str__(self):
         return f"[{self.status}] {self.name} ({self.phone})"
 
 # ==============================================================================
-# 4. 상담 이력 및 양방향 문자 로그 [수정됨]
+# 4. 상담 이력 및 양방향 문자 로그
 # ==============================================================================
 class ConsultationLog(models.Model):
     customer = models.ForeignKey(Customer, on_delete=models.CASCADE, related_name="logs")
@@ -109,9 +123,8 @@ class SMSLog(models.Model):
     direction = models.CharField(max_length=5, choices=DIRECTION_CHOICES, default='OUT', verbose_name="방향")
     status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='PENDING', verbose_name="상태")
     
-    # 에러 해결을 위해 created_at 필드를 추가/확인합니다.
     sent_at = models.DateTimeField(auto_now_add=True, verbose_name="발송 시간")
-    created_at = models.DateTimeField(auto_now_add=True, verbose_name="생성 시간") # 이 필드가 필요합니다.
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="생성 시간")
 
     class Meta:
         ordering = ['-created_at']
@@ -120,7 +133,7 @@ class SMSLog(models.Model):
         return f"[{self.get_direction_display()}] {self.customer.name}: {self.content[:20]}"
 
 
-# ⭐️ [추가] 광고 채널 관리 (이름, 단가)
+# [추가] 광고 채널 관리
 class AdChannel(models.Model):
     name = models.CharField(max_length=50, unique=True)
     cost = models.IntegerField(default=0)  # 단가
@@ -129,10 +142,33 @@ class AdChannel(models.Model):
     def __str__(self):
         return self.name
 
-# ⭐️ [추가] 은행 목록 관리
+# [추가] 은행 목록 관리
 class Bank(models.Model):
     name = models.CharField(max_length=50, unique=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
         return self.name
+
+
+
+# ⭐️ [신규] 공지사항 모델
+class Notice(models.Model):
+    title = models.CharField(max_length=200, verbose_name="제목")
+    content = models.TextField(verbose_name="내용")
+    is_important = models.BooleanField(default=False, verbose_name="중요 공지")
+    created_at = models.DateTimeField(auto_now_add=True)
+    writer = models.ForeignKey(User, on_delete=models.SET_NULL, null=True)
+
+    def __str__(self):
+        return self.title
+
+# ⭐️ [신규] 요금표/정책 이미지 모델
+class PolicyImage(models.Model):
+    PLATFORM_CHOICES = (('KT', 'KT'), ('SK', 'SK'), ('LG', 'LG'), ('Sky', 'Sky'))
+    platform = models.CharField(max_length=10, choices=PLATFORM_CHOICES)
+    image = models.ImageField(upload_to='policy_images/', verbose_name="정책 이미지")
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.platform} 정책 ({self.updated_at})"

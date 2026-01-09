@@ -16,19 +16,20 @@ from rest_framework.decorators import api_view, permission_classes, action
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.authtoken.models import Token
+from rest_framework.parsers import MultiPartParser, FormParser # ⭐️ 파일 업로드용 파서 추가
 from requests.auth import HTTPBasicAuth
 
 # 모델 및 시리얼라이저
 from .models import (
     Customer, User, ConsultationLog, Platform, 
     FailureReason, CustomStatus, SettlementStatus, SalesProduct, SMSLog,
-    AdChannel, Bank
+    AdChannel, Bank, Notice, PolicyImage # ⭐️ Notice, PolicyImage 추가
 )
 from .serializers import (
     CustomerSerializer, UserSerializer, PlatformSerializer, 
     ReasonSerializer, StatusSerializer, SettlementStatusSerializer, 
     SalesProductSerializer, LogSerializer,
-    AdChannelSerializer, BankSerializer
+    AdChannelSerializer, BankSerializer, NoticeSerializer, PolicyImageSerializer # ⭐️ 추가
 )
 
 # [유틸리티] 전화번호 정규화
@@ -118,7 +119,7 @@ class SMSReceiveView(APIView):
         data = request.data
         print(f"📩 [수신 데이터 분석]: {data}")
 
-        # 1. 데이터 파싱 (payload 구조 대응)
+        # 1. 데이터 파싱
         if 'payload' in data:
             payload = data['payload']
             from_num = payload.get('phoneNumber')
@@ -130,24 +131,22 @@ class SMSReceiveView(APIView):
         if not from_num or not msg_content:
             return Response({"message": "데이터 부족"}, status=400)
 
-        # 2. ⭐️ 중복 수신 방지 (최근 10초 내 동일 내용 차단)
+        # 2. 중복 수신 방지
         if SMSLog.objects.filter(content=msg_content, direction='IN', created_at__gte=timezone.now() - datetime.timedelta(seconds=10)).exists():
-            print(f"🛡️ 중복 문자 차단됨: {msg_content}")
             return Response({"status": "ignored", "message": "중복 메시지"}, status=200)
 
         # 3. 고객 찾기 및 자동 등록
         clean_num = clean_phone(from_num)
-        
-        # 번호 뒷 8자리로 검색해보고 없으면 새로 만듦
         customer = Customer.objects.filter(phone__contains=clean_num[-8:]).first()
         
         if not customer:
-            # 🚨 DB에 없는 번호면 '신규문의'로 자동 생성!
-            print(f"🆕 새로운 고객 자동 등록: {from_num}")
+            # 🚨 중요: 자동 생성 시 owner=None으로 설정하여 '미배정(공유)DB'로 가도록 함
+            print(f"🆕 새로운 고객 자동 등록 (미배정): {from_num}")
             customer = Customer.objects.create(
                 phone=clean_num,
-                name=f"신규문의({clean_num[-4:]})", # 예: 신규문의(1234)
+                name=f"신규문의({clean_num[-4:]})",
                 status='미통건',
+                owner=None, # 특정 상담사에게 자동 배정되지 않도록 None 설정
                 upload_date=datetime.date.today()
             )
 
@@ -159,9 +158,8 @@ class SMSReceiveView(APIView):
             direction='IN', 
             status='RECEIVED'
         )
-        print(f"✅ DB 저장 완료: {customer.name} - {msg_content}")
         
-        # 상태 업데이트 (부재 -> 재통)
+        # 상태 업데이트
         if customer.status == '부재':
             customer.status = '재통'
             customer.save()
@@ -170,6 +168,7 @@ class SMSReceiveView(APIView):
 
 
 class LeadCaptureView(APIView):
+    """ 랜딩페이지 등 외부 유입 """
     permission_classes = [AllowAny] 
 
     def post(self, request):
@@ -182,9 +181,10 @@ class LeadCaptureView(APIView):
         if not phone: return Response({"message": "연락처 필수"}, status=400)
 
         agent = None
-        if agent_id: agent = User.objects.filter(id=agent_id).first()
-        if not agent: agent = User.objects.first()
-
+        if agent_id: 
+            agent = User.objects.filter(id=agent_id).first()
+        
+        # agent_id가 없으면 미배정(None)으로 설정
         customer, created = Customer.objects.get_or_create(
             phone=phone,
             defaults={'name': name, 'owner': agent, 'status': '미통건', 'platform': platform}
@@ -230,9 +230,10 @@ def get_sms_history(request, customer_id):
 # ==============================================================================
 
 class UserViewSet(viewsets.ModelViewSet):
-    queryset = User.objects.filter(role='AGENT').order_by('-date_joined')
+    queryset = User.objects.all().order_by('-date_joined')
     serializer_class = UserSerializer
     permission_classes = [IsAuthenticated]
+    
     def create(self, request, *args, **kwargs):
         username = request.data.get('username'); password = request.data.get('password')
         if User.objects.filter(username=username).exists(): return Response({'message': '중복된 아이디'}, status=400)
@@ -242,10 +243,19 @@ class UserViewSet(viewsets.ModelViewSet):
 class CustomerViewSet(viewsets.ModelViewSet):
     serializer_class = CustomerSerializer
     permission_classes = [IsAuthenticated]
+    
     def get_queryset(self):
         user = self.request.user
-        if user.role == 'ADMIN': return Customer.objects.all().order_by('-upload_date', '-created_at')
+        # 관리자는 모든 데이터 조회
+        if user.role == 'ADMIN': 
+            return Customer.objects.all().order_by('-upload_date', '-created_at')
+        # 상담사는 본인 데이터 + 미배정 데이터 조회
         return Customer.objects.filter(Q(owner=user) | Q(owner__isnull=True)).order_by('-upload_date', '-created_at')
+
+    # PATCH 요청 시 request_status 등의 필드 업데이트 허용
+    def partial_update(self, request, *args, **kwargs):
+        kwargs['partial'] = True
+        return self.update(request, *args, **kwargs)
 
     @action(detail=True, methods=['post'])
     def add_log(self, request, pk=None):
@@ -255,14 +265,31 @@ class CustomerViewSet(viewsets.ModelViewSet):
     
     @action(detail=True, methods=['post'])
     def assign(self, request, pk=None):
-        customer = self.get_object(); customer.owner = request.user; customer.status = '재통'; customer.save()
+        customer = self.get_object()
+        # 요청한 유저(관리자 포함)에게 배정
+        target_user_id = request.data.get('user_id')
+        if target_user_id:
+            target_user = get_object_or_404(User, id=target_user_id)
+            customer.owner = target_user
+        else:
+            customer.owner = request.user
+            
+        customer.status = '재통'
+        customer.save()
         return Response({'message': '배정 완료'})
 
     @action(detail=False, methods=['post'])
     def allocate(self, request):
-        ids = request.data.get('customer_ids', []); agent_id = request.data.get('agent_id')
-        agent = get_object_or_404(User, id=agent_id)
-        Customer.objects.filter(id__in=ids).update(owner=agent, status='재통')
+        ids = request.data.get('customer_ids', [])
+        agent_id = request.data.get('agent_id')
+        
+        if agent_id:
+            agent = get_object_or_404(User, id=agent_id)
+            Customer.objects.filter(id__in=ids).update(owner=agent, status='재통')
+        else:
+            # agent_id 없으면 요청자(관리자 본인)에게 배정
+            Customer.objects.filter(id__in=ids).update(owner=request.user, status='재통')
+
         return Response({'message': '일괄 배정 완료'})
         
     @action(detail=False, methods=['post'])
@@ -270,10 +297,39 @@ class CustomerViewSet(viewsets.ModelViewSet):
         data = request.data.get('customers', []); cnt = 0
         for item in data:
             if not item.get('phone'): continue
-            Customer.objects.create(phone=clean_phone(item['phone']), name=item.get('name','미상'), upload_date=datetime.date.today(), status='미통건')
+            # 대량 등록 시 기본은 미배정(None)
+            Customer.objects.create(phone=clean_phone(item['phone']), name=item.get('name','미상'), upload_date=datetime.date.today(), status='미통건', owner=None)
             cnt += 1
         return Response({'message': f'{cnt}건 등록', 'count': cnt})
 
+# ⭐️ [신규] 공지사항 ViewSet
+class NoticeViewSet(viewsets.ModelViewSet):
+    queryset = Notice.objects.all().order_by('-is_important', '-created_at')
+    serializer_class = NoticeSerializer
+    permission_classes = [IsAuthenticated]
+
+    def perform_create(self, serializer):
+        serializer.save(writer=self.request.user)
+
+# ⭐️ [신규] 정책 이미지 ViewSet
+class PolicyImageViewSet(viewsets.ModelViewSet):
+    queryset = PolicyImage.objects.all()
+    serializer_class = PolicyImageSerializer
+    permission_classes = [IsAuthenticated]
+    parser_classes = (MultiPartParser, FormParser) # 이미지 업로드용
+
+    # 통신사별 최신 이미지만 가져오는 API
+    @action(detail=False, methods=['get'])
+    def latest(self, request):
+        data = {}
+        for p in ['KT', 'SK', 'LG', 'Sky']:
+            img = PolicyImage.objects.filter(platform=p).order_by('-updated_at').first()
+            if img:
+                # 전체 URL 생성하여 반환
+                data[p] = request.build_absolute_uri(img.image.url)
+        return Response(data)
+
+# ... (나머지 ViewSet들은 그대로 유지)
 class PlatformViewSet(viewsets.ModelViewSet): queryset = Platform.objects.all(); serializer_class = PlatformSerializer; permission_classes = [IsAuthenticated]
 class FailureReasonViewSet(viewsets.ModelViewSet): queryset = FailureReason.objects.all(); serializer_class = ReasonSerializer; permission_classes = [IsAuthenticated]
 class CustomStatusViewSet(viewsets.ModelViewSet): queryset = CustomStatus.objects.all(); serializer_class = StatusSerializer; permission_classes = [IsAuthenticated]
@@ -294,3 +350,56 @@ def get_dashboard_stats(request):
     target = Customer.objects.filter(q)
     profit = sum((int(c.agent_policy or 0)-int(c.support_amt or 0))*10000 for c in target.filter(status__in=['접수완료','설치완료']))
     return Response({'total_db': target.count(), 'accept_count': target.filter(status__in=['접수완료','설치완료']).count(), 'net_profit': profit})
+
+
+# ==============================================================================
+# 4. 통화 팝업 및 녹음 파일 저장 API
+# ==============================================================================
+
+class CallPopupView(APIView):
+    permission_classes = [AllowAny] 
+
+    def post(self, request):
+        phone = clean_phone(request.data.get('phone')) 
+        if not phone: return Response({'message': '전화번호가 없습니다.'}, status=400)
+
+        customer = Customer.objects.filter(phone=phone).first()
+        customer_name = customer.name if customer else "신규문의"
+        customer_id = customer.id if customer else None
+        
+        print(f"📞 [전화 수신] {customer_name} ({phone})")
+        return Response({'status': 'success', 'customer_name': customer_name, 'customer_id': customer_id, 'message': 'PC 팝업 요청 확인'}, status=200)
+
+
+class CallRecordSaveView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        phone = clean_phone(request.data.get('phone'))
+        file_link = request.data.get('file_link') 
+        
+        if not phone or not file_link:
+            return Response({'message': '데이터 부족'}, status=400)
+
+        customer = Customer.objects.filter(phone=phone).first()
+        if not customer:
+            # 신규 생성 시 owner=None (미배정)
+            customer = Customer.objects.create(
+                phone=phone, 
+                name=f"미등록({phone[-4:]})",
+                status='미통건',
+                owner=None, 
+                upload_date=datetime.date.today()
+            )
+
+        writer = customer.owner if customer.owner else None 
+        
+        ConsultationLog.objects.create(
+            customer=customer,
+            writer=writer, 
+            content=f"[자동저장] 통화 녹취 파일: {file_link}"
+        )
+        
+        print(f"💾 [녹음 저장] {customer.name} - 링크 저장 완료")
+
+        return Response({'status': 'success', 'message': '녹음 파일 연결 완료'}, status=201)

@@ -2,7 +2,8 @@ from rest_framework import serializers
 from .models import (
     Customer, User, ConsultationLog, 
     Platform, FailureReason, CustomStatus, 
-    SettlementStatus, SalesProduct, AdChannel, Bank # ⭐️ 신규 모델 임포트
+    SettlementStatus, SalesProduct, AdChannel, Bank,
+    Notice, PolicyImage # ⭐️ 신규 모델 임포트
 )
 
 # ==============================================================================
@@ -61,8 +62,11 @@ class CustomerSerializer(serializers.ModelSerializer):
     # 상담 로그를 포함해서 가져옴 (읽기 전용)
     logs = LogSerializer(many=True, read_only=True)
     
-    # 💰 [순수익 자동 계산 필드] (정책금 - 지원금 - 광고비)
+    # 💰 [순수익 자동 계산 필드] (정책금 - 지원금) * 10000
     net_profit = serializers.SerializerMethodField()
+
+    # 👤 담당자 이름 (읽기 전용, 편의성)
+    owner_name = serializers.ReadOnlyField(source='owner.username')
 
     class Meta:
         model = Customer
@@ -82,8 +86,12 @@ class CustomerSerializer(serializers.ModelSerializer):
             
             # --- 기타 정보 ---
             'product_info', 'usim_info', 'additional_info',
-            'owner', 'upload_date', 'last_memo', 'checklist',
+            'owner', 'owner_name', 'upload_date', 'last_memo', 'checklist',
             
+            # --- ⭐️ [신규] 관리자 확인 요청 필드 ---
+            'request_status', 
+            'request_message',
+
             # --- 사유 및 로그 ---
             'detail_reason', 'as_reason', 'is_as_approved',
             'logs', 
@@ -91,7 +99,6 @@ class CustomerSerializer(serializers.ModelSerializer):
         ]
 
     # 순수익 계산 로직: (본사정책 - 지원금) * 10000
-    # 필요하다면 여기에 광고비(ad_cost) 차감 로직을 추가할 수도 있습니다.
     def get_net_profit(self, obj):
         policy = obj.policy_amt or 0
         support = obj.support_amt or 0
@@ -111,4 +118,18 @@ class AdChannelSerializer(serializers.ModelSerializer):
 class BankSerializer(serializers.ModelSerializer):
     class Meta:
         model = Bank
+        fields = '__all__'
+
+
+class NoticeSerializer(serializers.ModelSerializer):
+    writer_name = serializers.ReadOnlyField(source='writer.username')
+    created_at = serializers.DateTimeField(format="%Y-%m-%d", read_only=True)
+
+    class Meta:
+        model = Notice
+        fields = '__all__'
+
+class PolicyImageSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PolicyImage
         fields = '__all__'
