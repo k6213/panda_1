@@ -33,7 +33,6 @@ from .serializers import (
     AdChannelSerializer, BankSerializer, NoticeSerializer, PolicyImageSerializer
 )
 
-# ⭐️ 설정 데이터 파일 임포트
 from .system_config import CONFIG_DATA
 
 # [유틸리티] 전화번호 정규화
@@ -45,23 +44,21 @@ def clean_phone(phone):
     return cleaned
 
 # ==============================================================================
-# [핵심] 문자 발송 함수 (핸드폰 앱 연동)
+# [핵심] 문자 발송 함수
 # ==============================================================================
 def send_traccar_cloud_sms(phone, sms_text):
-    phone_ip = "192.168.35.2"   # 핸드폰 IP
-    port = "8080"               # 앱 포트
-    username = "sms"            # 앱 아이디
-    password = "YmPQD1pa"       # 앱 비밀번호
+    phone_ip = "192.168.35.2"
+    port = "8080"
+    username = "sms"
+    password = "YmPQD1pa"
     url = f"http://{phone_ip}:{port}/message"
     payload = { "phoneNumbers": [phone], "message": sms_text }
 
     try:
         response = requests.post(url, json=payload, auth=HTTPBasicAuth(username, password), timeout=3)
         if response.status_code in [200, 201, 202]:
-            print(f"✅ 문자 발송 성공: {phone}")
             return True
         else:
-            print(f"⚠️ 앱 거부 ({response.status_code}): {response.text}")
             return False
     except Exception as e:
         print(f"❌ 연결 실패: {e}")
@@ -102,7 +99,7 @@ def update_fcm_token_view(request):
     return Response({'status': 'success', 'message': '📱 기기 연동 완료!', 'agent': user.username})
 
 # ==============================================================================
-# 2. 🔥 SMS 및 고객 유입 (중복 방지 & 자동 등록)
+# 2. SMS 및 고객 유입
 # ==============================================================================
 
 class SMSReceiveView(APIView):
@@ -120,7 +117,6 @@ class SMSReceiveView(APIView):
         if not from_num or not msg_content:
             return Response({"message": "데이터 부족"}, status=400)
 
-        # 10초 이내 중복 메시지 방지
         if SMSLog.objects.filter(content=msg_content, direction='IN', created_at__gte=timezone.now() - datetime.timedelta(seconds=10)).exists():
             return Response({"status": "ignored", "message": "중복 메시지"}, status=200)
 
@@ -203,7 +199,7 @@ def get_sms_history(request, customer_id):
 
 class StatisticsView(APIView):
     """
-    📊 통합 통계 API (요청하신 계산식 및 일별/월별 필터링 적용)
+    📊 통합 통계 API (플랫폼별 광고비 단가 적용)
     """
     permission_classes = [IsAuthenticated]
 
@@ -214,112 +210,100 @@ class StatisticsView(APIView):
         
         queryset = Customer.objects.all()
         
-        # ⭐️ 1. 기간 필터 (일별/월별 구분 로직 수정됨)
+        # 1. 기간 필터
         if start_date:
-            # start_date의 길이를 통해 일별(10)인지 월별(7)인지 판단
-            if len(start_date) == 10:  # 예: '2026-01-12' (일별)
-                if not end_date:
-                    end_date = start_date # 종료일 없으면 당일 조회
+            if len(start_date) == 10:  # 일별
+                if not end_date: end_date = start_date 
                 queryset = queryset.filter(upload_date__range=[start_date, end_date])
-            elif len(start_date) == 7: # 예: '2026-01' (월별)
+            elif len(start_date) == 7: # 월별
                 queryset = queryset.filter(upload_date__startswith=start_date)
 
         # 2. 플랫폼 필터
         if platform_filter != 'ALL':
             queryset = queryset.filter(platform=platform_filter)
 
-        # 정책금 단위 보정 (문자열 -> 정수형 변환)
+        # 정책금 단위 보정
         agent_policy_val = Cast(Coalesce(F('agent_policy'), Value(0)), IntegerField())
         support_amt_val = Cast(Coalesce(F('support_amt'), Value(0)), IntegerField())
-        
         revenue_expression = (agent_policy_val - support_amt_val) * 10000
 
-        # 3. 데이터 집계 (상담사 + 플랫폼 기준 그룹화)
+        # 3. 데이터 집계
         raw_stats = queryset.values('owner', 'owner__username', 'platform').annotate(
-            
-            # [1] 전체 DB
             total_db=Count('id'),
-
-            # [2] 광고비 적용 대상 (AS 제외)
             ad_target_count=Count('id', filter=~Q(status__in=['AS요청', '실패', '중복', '실패이관'])),
-
-            # [3] 접수 건수
             accepted_count=Count('id', filter=Q(status__in=['접수완료', '설치완료', '해지진행'])),
-            
-            # [4] 설치 건수
             installed_count=Count('id', filter=Q(status='설치완료')),
-            
-            # [5] 취소 건수
             canceled_count=Count('id', filter=Q(status='접수취소')),
-
-            # [6] 접수완료 매출
-            accepted_revenue=Sum(
-                Case(
-                    When(status__in=['접수완료', '설치완료', '해지진행'], then=revenue_expression),
-                    default=0,
-                    output_field=IntegerField()
-                )
-            ),
-
-            # [7] 설치완료 매출
-            installed_revenue=Sum(
-                Case(
-                    When(status='설치완료', then=revenue_expression),
-                    default=0,
-                    output_field=IntegerField()
-                )
-            )
+            accepted_revenue=Sum(Case(When(status__in=['접수완료', '설치완료', '해지진행'], then=revenue_expression), default=0, output_field=IntegerField())),
+            installed_revenue=Sum(Case(When(status='설치완료', then=revenue_expression), default=0, output_field=IntegerField()))
         ).order_by('owner')
 
-        # 4. 데이터 재구조화 & 계산
-        agent_map = {}
-        AD_COST_PER_DB = 15000 
+        # ⭐️ [핵심 수정] 광고 채널 단가 로드
+        # 예: {'당근': 10000, '토스': 15000, ...}
+        ad_costs = { ac.name: ac.cost for ac in AdChannel.objects.all() }
 
+        # 모든 유저 기본값 세팅
+        all_users = User.objects.all()
+        agent_map = {
+            str(u.id): {
+                "id": str(u.id), "name": u.username, 
+                "db": 0, "adTargetDb": 0, "accepted": 0, "installed": 0, "canceled": 0,
+                "acceptedRevenue": 0, "installedRevenue": 0, 
+                "adSpend": 0, # 🟢 서버에서 계산된 총 광고비
+                "platformDetails": []
+            } for u in all_users
+        }
+        agent_map['unknown'] = {
+            "id": "unknown", "name": "미배정", 
+            "db": 0, "adTargetDb": 0, "accepted": 0, "installed": 0, "canceled": 0,
+            "acceptedRevenue": 0, "installedRevenue": 0, "adSpend": 0,
+            "platformDetails": []
+        }
+
+        # 4. 집계 및 광고비 계산
         for row in raw_stats:
-            owner_id = row['owner'] or 'unknown'
-            owner_name = row['owner__username'] if row['owner__username'] else "미배정"
-            platform_name = row['platform'] or '기타'
-
-            if owner_id not in agent_map:
-                agent_map[owner_id] = {
-                    "id": owner_id, 
-                    "name": owner_name, 
-                    "db": 0, 
-                    "adTargetDb": 0, 
-                    "accepted": 0, 
-                    "installed": 0, 
-                    "canceled": 0,
-                    "acceptedRevenue": 0, 
-                    "installedRevenue": 0,
-                    "platformDetails": []
-                }
+            owner_id = str(row['owner']) if row['owner'] else 'unknown'
+            if owner_id not in agent_map: continue 
 
             agent = agent_map[owner_id]
+            platform_name = row['platform'] or '기타'
             
-            agent['db'] += (row['total_db'] or 0)
-            agent['adTargetDb'] += (row['ad_target_count'] or 0)
+            # 수치 합산
+            db_count = (row['total_db'] or 0)
+            ad_target_db = (row['ad_target_count'] or 0)
+
+            agent['db'] += db_count
+            agent['adTargetDb'] += ad_target_db
             agent['accepted'] += (row['accepted_count'] or 0)
             agent['installed'] += (row['installed_count'] or 0)
             agent['canceled'] += (row['canceled_count'] or 0)
             agent['acceptedRevenue'] += (row['accepted_revenue'] or 0)
             agent['installedRevenue'] += (row['installed_revenue'] or 0)
 
+            # 🟢 [핵심] 플랫폼별 광고비 계산 (단가 * 유효DB수)
+            # 단가가 없으면 기본 0원 처리
+            unit_cost = ad_costs.get(platform_name, 0)
+            platform_ad_spend = ad_target_db * unit_cost
+            
+            agent['adSpend'] += platform_ad_spend # 총 광고비에 누적
+
             agent['platformDetails'].append({
                 "name": platform_name,
-                "db": (row['total_db'] or 0),
-                "adTargetDb": (row['ad_target_count'] or 0),
+                "db": db_count,
+                "adTargetDb": ad_target_db,
                 "accepted": (row['accepted_count'] or 0),
                 "installed": (row['installed_count'] or 0),
                 "canceled": (row['canceled_count'] or 0),
                 "acceptedRevenue": (row['accepted_revenue'] or 0),
                 "installedRevenue": (row['installed_revenue'] or 0),
+                "adSpend": platform_ad_spend # 플랫폼별 광고비
             })
 
         final_results = []
 
+        # 5. 최종 마진/수익율 계산
         for agent in agent_map.values():
-            # [계산식 적용]
-            agent['adSpend'] = agent['adTargetDb'] * AD_COST_PER_DB
+            # 순수익 = 설치매출 - 광고비
             agent['netProfit'] = agent['installedRevenue'] - agent['adSpend']
             agent['avgMargin'] = round(agent['acceptedRevenue'] / agent['accepted']) if agent['accepted'] > 0 else 0
             agent['acceptRate'] = round((agent['accepted'] / agent['db'] * 100), 1) if agent['db'] > 0 else 0
@@ -330,7 +314,6 @@ class StatisticsView(APIView):
 
             # 플랫폼별 데이터도 동일 로직 적용
             for pf in agent['platformDetails']:
-                pf['adSpend'] = pf['adTargetDb'] * AD_COST_PER_DB
                 pf['netProfit'] = pf['installedRevenue'] - pf['adSpend']
                 pf['avgMargin'] = round(pf['acceptedRevenue'] / pf['accepted']) if pf['accepted'] > 0 else 0
                 pf['acceptRate'] = round((pf['accepted'] / pf['db'] * 100), 1) if pf['db'] > 0 else 0
@@ -338,9 +321,18 @@ class StatisticsView(APIView):
                 pf_total_receipts = pf['accepted'] + pf['canceled']
                 pf['cancelRate'] = round((pf['canceled'] / pf_total_receipts * 100), 1) if pf_total_receipts > 0 else 0
                 pf['netInstallRate'] = round((pf['accepted'] / pf['db'] * 100), 1) if pf['db'] > 0 else 0
+                
+                # 순이익율
+                p_revenue = pf['acceptedRevenue'] + pf['installedRevenue']
+                pf['netProfitMargin'] = round((pf['netProfit'] / p_revenue * 100), 1) if p_revenue > 0 else 0
 
             # DB수 많은 순으로 플랫폼 정렬
             agent['platformDetails'].sort(key=lambda x: x['db'], reverse=True)
+            
+            # 전체 순이익율
+            t_revenue = agent['acceptedRevenue'] + agent['installedRevenue']
+            agent['netProfitMargin'] = round((agent['netProfit'] / t_revenue * 100), 1) if t_revenue > 0 else 0
+
             final_results.append(agent)
 
         # 설치 매출 순으로 상담사 정렬
@@ -348,16 +340,12 @@ class StatisticsView(APIView):
 
         return Response(final_results)
 
-# ==============================================================================
-# 4. 모델 ViewSets (CRUD) & ⭐️ 설정 API
-# ==============================================================================
-
-# ⭐️ [최적화] 시스템 설정 API (분리된 파일 사용 & 캐싱)
+# ... (나머지 ViewSet들은 기존과 동일하므로 생략 가능, 위 StatisticsView가 핵심) ...
 class SystemConfigView(APIView):
     permission_classes = [AllowAny]
     def get(self, request):
         response = Response(CONFIG_DATA)
-        response['Cache-Control'] = 'public, max-age=86400' # 24시간 캐싱
+        response['Cache-Control'] = 'public, max-age=86400' 
         return response
 
 class UserViewSet(viewsets.ModelViewSet):
@@ -378,17 +366,14 @@ class CustomerViewSet(viewsets.ModelViewSet):
         user = self.request.user
         if user.role == 'ADMIN': return Customer.objects.all().order_by('-upload_date', '-created_at')
         return Customer.objects.filter(Q(owner=user) | Q(owner__isnull=True)).order_by('-upload_date', '-created_at')
-    
     def partial_update(self, request, *args, **kwargs):
         kwargs['partial'] = True
         return self.update(request, *args, **kwargs)
-
     @action(detail=True, methods=['post'])
     def add_log(self, request, pk=None):
         customer = self.get_object()
         ConsultationLog.objects.create(customer=customer, writer=request.user, content=request.data.get('content'))
         return Response({'status': 'success'})
-    
     @action(detail=True, methods=['post'])
     def assign(self, request, pk=None):
         customer = self.get_object()
@@ -398,7 +383,6 @@ class CustomerViewSet(viewsets.ModelViewSet):
         customer.status = '재통'
         customer.save()
         return Response({'message': '배정 완료'})
-
     @action(detail=False, methods=['post'])
     def allocate(self, request):
         ids = request.data.get('customer_ids', [])
@@ -406,49 +390,26 @@ class CustomerViewSet(viewsets.ModelViewSet):
         if agent_id: agent = get_object_or_404(User, id=agent_id); Customer.objects.filter(id__in=ids).update(owner=agent, status='재통')
         else: Customer.objects.filter(id__in=ids).update(owner=request.user, status='재통')
         return Response({'message': '일괄 배정 완료'})
-        
     @action(detail=False, methods=['post'])
     def bulk_upload(self, request):
         data = request.data.get('customers', []); cnt = 0
         for item in data:
             if not item.get('phone'): continue
-            Customer.objects.create(
-                phone=clean_phone(item['phone']), 
-                name=item.get('name','미상'), 
-                upload_date=datetime.date.today(), 
-                status='미통건', 
-                owner=None,
-                platform=item.get('platform', '기타')
-            )
+            Customer.objects.create(phone=clean_phone(item['phone']), name=item.get('name','미상'), upload_date=datetime.date.today(), status='미통건', owner=None, platform=item.get('platform', '기타'))
             cnt += 1
         return Response({'message': f'{cnt}건 등록', 'count': cnt})
-
     @action(detail=False, methods=['post'])
     def referral(self, request):
         data = request.data
         user = request.user
-        Customer.objects.create(
-            name=data.get('name', '지인소개'),
-            phone=clean_phone(data.get('phone')),
-            platform=data.get('platform', '지인'),
-            status='접수완료',
-            owner=user,
-            upload_date=datetime.date.today(),
-            product_info=data.get('product_info', '')
-        )
+        Customer.objects.create(name=data.get('name', '지인소개'), phone=clean_phone(data.get('phone')), platform=data.get('platform', '지인'), status='접수완료', owner=user, upload_date=datetime.date.today(), product_info=data.get('product_info', ''))
         return Response({'message': '지인 접수 등록 완료'}, status=201)
 
 class NoticeViewSet(viewsets.ModelViewSet):
-    queryset = Notice.objects.all().order_by('-is_important', '-created_at')
-    serializer_class = NoticeSerializer
-    permission_classes = [IsAuthenticated]
+    queryset = Notice.objects.all().order_by('-is_important', '-created_at'); serializer_class = NoticeSerializer; permission_classes = [IsAuthenticated]
     def perform_create(self, serializer): serializer.save(writer=self.request.user)
-
 class PolicyImageViewSet(viewsets.ModelViewSet):
-    queryset = PolicyImage.objects.all()
-    serializer_class = PolicyImageSerializer
-    permission_classes = [IsAuthenticated]
-    parser_classes = (MultiPartParser, FormParser)
+    queryset = PolicyImage.objects.all(); serializer_class = PolicyImageSerializer; permission_classes = [IsAuthenticated]; parser_classes = (MultiPartParser, FormParser)
     @action(detail=False, methods=['get'])
     def latest(self, request):
         data = {}
@@ -457,7 +418,6 @@ class PolicyImageViewSet(viewsets.ModelViewSet):
             if img: data[p] = request.build_absolute_uri(img.image.url)
         return Response(data)
 
-# 기타 룩업 테이블
 class PlatformViewSet(viewsets.ModelViewSet): queryset = Platform.objects.all(); serializer_class = PlatformSerializer; permission_classes = [IsAuthenticated]
 class FailureReasonViewSet(viewsets.ModelViewSet): queryset = FailureReason.objects.all(); serializer_class = ReasonSerializer; permission_classes = [IsAuthenticated]
 class CustomStatusViewSet(viewsets.ModelViewSet): queryset = CustomStatus.objects.all(); serializer_class = StatusSerializer; permission_classes = [IsAuthenticated]
@@ -467,9 +427,6 @@ class ConsultationLogViewSet(viewsets.ModelViewSet): queryset = ConsultationLog.
 class AdChannelViewSet(viewsets.ModelViewSet): queryset = AdChannel.objects.all(); serializer_class = AdChannelSerializer; permission_classes = [IsAuthenticated]
 class BankViewSet(viewsets.ModelViewSet): queryset = Bank.objects.all(); serializer_class = BankSerializer; permission_classes = [IsAuthenticated]
 
-# ==============================================================================
-# 5. 통화 팝업 및 녹음 파일 저장
-# ==============================================================================
 class CallPopupView(APIView):
     permission_classes = [AllowAny] 
     def post(self, request):
