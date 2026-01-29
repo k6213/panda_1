@@ -24,13 +24,13 @@ from requests.auth import HTTPBasicAuth
 from .models import (
     Customer, User, ConsultationLog, Platform, 
     FailureReason, CustomStatus, SettlementStatus, SalesProduct, SMSLog,
-    AdChannel, Bank, Notice, PolicyImage
+    AdChannel, Bank, Notice, PolicyImage, TodoTask, CancelReason, Client
 )
 from .serializers import (
     CustomerSerializer, UserSerializer, PlatformSerializer, 
     ReasonSerializer, StatusSerializer, SettlementStatusSerializer, 
     SalesProductSerializer, LogSerializer,
-    AdChannelSerializer, BankSerializer, NoticeSerializer, PolicyImageSerializer
+    AdChannelSerializer, BankSerializer, NoticeSerializer, PolicyImageSerializer, TodoTaskSerializer, CancelReasonSerializer, ClientSerializer
 )
 
 from .system_config import CONFIG_DATA
@@ -172,17 +172,40 @@ class LeadCaptureView(APIView):
 @permission_classes([IsAuthenticated])
 def send_manual_sms(request):
     customer_id = request.data.get('customer_id')
-    sms_text = request.data.get('message')
+    sms_text = request.data.get('message', '').strip() # 공백 제거
+    image_file = request.FILES.get('image') # 🟢 [추가] 프론트에서 보낸 파일 수신
+    
     agent = request.user
     customer = get_object_or_404(Customer, id=customer_id)
 
-    log = SMSLog.objects.create(customer=customer, agent=agent, content=sms_text, direction='OUT', status='PENDING')
+    # 1. 텍스트가 없고 이미지도 없으면 에러
+    if not sms_text and not image_file:
+        return Response({"message": "내용 또는 이미지가 필요합니다."}, status=400)
 
+    # 2. 텍스트가 비어있는데 이미지가 있다면 대체 텍스트 설정 (DB 에러 방지)
+    if not sms_text and image_file:
+        sms_text = "(사진 첨부)"
+
+    # 3. 로그 생성 (이미지 포함)
+    log = SMSLog.objects.create(
+        customer=customer, 
+        agent=agent, 
+        content=sms_text, 
+        image=image_file,  # 🟢 [추가] DB에 이미지 파일 저장
+        direction='OUT', 
+        status='PENDING'
+    )
+
+    # 4. 문자 발송 (Traccar는 텍스트만 전송)
+    # (참고: 실제 이미지를 MMS로 보내려면 게이트웨이가 지원해야 함. 
+    #  여기서는 DB에 저장하고, 상대방에겐 텍스트 알림이 가는 구조입니다.)
     if send_traccar_cloud_sms(clean_phone(customer.phone), sms_text):
-        log.status = 'SUCCESS'; log.save()
+        log.status = 'SUCCESS'
+        log.save()
         return Response({"message": "전송 성공", "log_id": log.id}, status=200)
     else:
-        log.status = 'FAIL'; log.save()
+        log.status = 'FAIL'
+        log.save()
         return Response({"message": "발송 실패 (앱 연결 확인 필요)", "log_id": log.id}, status=200)
 
 @api_view(['GET'])
@@ -190,7 +213,23 @@ def send_manual_sms(request):
 def get_sms_history(request, customer_id):
     customer = get_object_or_404(Customer, id=customer_id)
     logs = SMSLog.objects.filter(customer=customer).order_by('created_at')
-    data = [{'id': l.id, 'sender': 'me' if l.direction == 'OUT' else 'other', 'text': l.content, 'created_at': l.created_at.strftime("%Y-%m-%d %H:%M"), 'status': l.status} for l in logs]
+    
+    data = []
+    for l in logs:
+        # 🟢 [추가] 이미지가 있으면 URL 생성, 없으면 None
+        image_url = None
+        if l.image:
+            image_url = request.build_absolute_uri(l.image.url)
+
+        data.append({
+            'id': l.id,
+            'sender': 'me' if l.direction == 'OUT' else 'other',
+            'text': l.content,
+            'image': image_url, # 🟢 [추가] 프론트엔드로 이미지 주소 전달
+            'created_at': l.created_at.strftime("%Y-%m-%d %H:%M"),
+            'status': l.status
+        })
+        
     return Response(data)
 
 # ==============================================================================
@@ -390,20 +429,71 @@ class CustomerViewSet(viewsets.ModelViewSet):
         if agent_id: agent = get_object_or_404(User, id=agent_id); Customer.objects.filter(id__in=ids).update(owner=agent, status='재통')
         else: Customer.objects.filter(id__in=ids).update(owner=request.user, status='재통')
         return Response({'message': '일괄 배정 완료'})
+
     @action(detail=False, methods=['post'])
     def bulk_upload(self, request):
-        data = request.data.get('customers', []); cnt = 0
+        data = request.data.get('customers', [])
+        cnt = 0
+        
         for item in data:
             if not item.get('phone'): continue
-            Customer.objects.create(phone=clean_phone(item['phone']), name=item.get('name','미상'), upload_date=datetime.date.today(), status='미통건', owner=None, platform=item.get('platform', '기타'))
+            
+            # 🟢 [수정됨] 프론트엔드에서 보낸 담당자(owner_id)와 상태(status) 받기
+            owner_id = item.get('owner_id')
+            status_val = item.get('status', '미통건') # 값이 없으면 '미통건' 기본값
+            last_memo = item.get('last_memo')         # 엑셀의 상담 내용
+
+            # 담당자 객체 찾기 (ID가 있을 경우)
+            owner_obj = None
+            if owner_id:
+                try:
+                    owner_obj = User.objects.get(id=owner_id)
+                except User.DoesNotExist:
+                    owner_obj = None
+
+            # 🟢 [수정됨] DB 생성 시 담당자와 상태값 적용
+            customer = Customer.objects.create(
+                phone=clean_phone(item['phone']), 
+                name=item.get('name', '미상'), 
+                upload_date=datetime.date.today(), 
+                status=status_val,        # 👈 탭에 맞는 상태 (접수완료/장기가망 등)
+                owner=owner_obj,          # 👈 탭에 맞는 담당자 (나)
+                platform=item.get('platform', '기타')
+            )
+
+            # 🟢 [수정됨] 상담 메모가 있다면 로그와 함께 저장
+            if last_memo:
+                customer.last_memo = last_memo
+                customer.save()
+                ConsultationLog.objects.create(
+                    customer=customer,
+                    writer=owner_obj if owner_obj else request.user, # 담당자 혹은 업로더
+                    content=f"[초기메모] {last_memo}"
+                )
+
             cnt += 1
-        return Response({'message': f'{cnt}건 등록', 'count': cnt})
+            
+        return Response({'message': f'{cnt}건 등록 완료', 'count': cnt})
+
     @action(detail=False, methods=['post'])
     def referral(self, request):
         data = request.data
         user = request.user
         Customer.objects.create(name=data.get('name', '지인소개'), phone=clean_phone(data.get('phone')), platform=data.get('platform', '지인'), status='접수완료', owner=user, upload_date=datetime.date.today(), product_info=data.get('product_info', ''))
         return Response({'message': '지인 접수 등록 완료'}, status=201)
+        
+    @action(detail=True, methods=['get'])
+    def logs(self, request, pk=None):
+        customer = self.get_object()
+        
+        # related_name='logs'로 설정되어 있다고 가정 (ConsultationLog 모델 등)
+        # 만약 에러나면 customer.consultationlog_set.all() 로 변경 시도
+        logs = customer.logs.all().order_by('-created_at') 
+        
+        from .serializers import LogSerializer
+        serializer = LogSerializer(logs, many=True)
+        
+        return Response(serializer.data)
 
 class NoticeViewSet(viewsets.ModelViewSet):
     queryset = Notice.objects.all().order_by('-is_important', '-created_at'); serializer_class = NoticeSerializer; permission_classes = [IsAuthenticated]
@@ -449,6 +539,32 @@ class CallRecordSaveView(APIView):
         print(f"💾 [녹음 저장] {customer.name} - 링크 저장 완료")
         return Response({'status': 'success', 'message': '녹음 파일 연결 완료'}, status=201)
 
+
+
+class TodoTaskViewSet(viewsets.ModelViewSet):
+    queryset = TodoTask.objects.all()
+    serializer_class = TodoTaskSerializer
+
+    def perform_create(self, serializer):
+        serializer.save(sender=self.request.user)
+
+    # 관리자용: 내가 지시한 업무 목록 조회
+    @action(detail=False, methods=['get'])
+    def assigned(self, request):
+        # 내가 보낸 것 or 전체 공지
+        tasks = TodoTask.objects.all().order_by('-created_at')
+        serializer = self.get_serializer(tasks, many=True)
+        return Response(serializer.data)
+
+class CancelReasonViewSet(viewsets.ModelViewSet): 
+    queryset = CancelReason.objects.all().order_by('-created_at')
+    serializer_class = CancelReasonSerializer
+    permission_classes = [IsAuthenticated]
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def get_dashboard_stats(request): return Response({'message': 'Use /api/stats/advanced/ instead'})
+
+
+class ClientViewSet(viewsets.ModelViewSet):
+    queryset = Client.objects.all().order_by('name')
+    serializer_class = ClientSerializer

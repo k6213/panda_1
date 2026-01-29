@@ -3,7 +3,7 @@ from .models import (
     Customer, User, ConsultationLog, 
     Platform, FailureReason, CustomStatus, 
     SettlementStatus, SalesProduct, AdChannel, Bank,
-    Notice, PolicyImage # ⭐️ 신규 모델 임포트
+    Notice, PolicyImage, TodoTask, CancelReason, Client # ⭐️ 신규 모델 임포트
 )
 
 # ==============================================================================
@@ -73,7 +73,7 @@ class CustomerSerializer(serializers.ModelSerializer):
         # ⭐️ 새로 추가한 모든 필드를 명시합니다.
         fields = [
             'id', 'name', 'phone', 'platform', 
-            'status', 'rank', 'callback_schedule',
+            'status', 'rank', 'callback_schedule','client',
             
             # --- 정산 관련 ---
             'policy_amt',   # 본사 확정
@@ -83,6 +83,7 @@ class CustomerSerializer(serializers.ModelSerializer):
             'installed_date', 'net_profit', # 순수익
             'settlement_due_date', # ⭐️ 정산예정일
             'settlement_status',   # ⭐️ 정산 상태
+            'settlement_complete_date',
             
             # --- 기타 정보 ---
             'product_info', 'usim_info', 'additional_info',
@@ -96,6 +97,7 @@ class CustomerSerializer(serializers.ModelSerializer):
             'detail_reason', 'as_reason', 'is_as_approved',
             'logs', 
             'created_at', 'updated_at',
+            'settlement_memo',
         ]
 
     # 순수익 계산 로직: (본사정책 - 지원금) * 10000
@@ -132,4 +134,29 @@ class NoticeSerializer(serializers.ModelSerializer):
 class PolicyImageSerializer(serializers.ModelSerializer):
     class Meta:
         model = PolicyImage
+        fields = '__all__'
+
+
+# sales/serializers.py 맨 아래
+
+# 🟢 [추가] 업무 지시(Todo) 시리얼라이저
+class TodoTaskSerializer(serializers.ModelSerializer):
+    sender_name = serializers.ReadOnlyField(source='sender.username')       # 보낸 사람 이름 표시
+    assigned_to_name = serializers.ReadOnlyField(source='assigned_to.username') # 담당자 이름 표시
+
+    sender = serializers.PrimaryKeyRelatedField(read_only=True)
+
+    class Meta:
+        model = TodoTask
+        fields = '__all__'
+
+class CancelReasonSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = CancelReason
+        fields = '__all__'
+
+
+class ClientSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Client
         fields = '__all__'

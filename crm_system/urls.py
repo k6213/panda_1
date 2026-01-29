@@ -8,6 +8,7 @@ from rest_framework.routers import DefaultRouter
 # 현재 기준으로는 'sales'로 되어 있어 유지합니다.
 from sales import views  
 
+
 # ==============================================================================
 # 🔄 Router 설정 (ViewSet 자동 연결)
 # ==============================================================================
@@ -30,9 +31,17 @@ router.register(r'logs', views.ConsultationLogViewSet)
 router.register(r'ad_channels', views.AdChannelViewSet) # 광고 채널
 router.register(r'banks', views.BankViewSet)            # 은행
 
-# ⭐️ 4. [신규] 정책 및 공지사항 관리
+# 4. 정책 및 공지사항 관리
 router.register(r'notices', views.NoticeViewSet)        # 공지사항
 router.register(r'policies', views.PolicyImageViewSet)  # 정책 이미지
+
+# 🟢 [추가됨] 5. 업무 및 To-Do 관리
+# 이 부분이 추가되어야 /api/todos/ 및 /api/todos/assigned/ 경로가 생성됩니다.
+router.register(r'todos', views.TodoTaskViewSet, basename='todos')
+
+router.register(r'cancel_reasons', views.CancelReasonViewSet)
+
+router.register(r'clients', views.ClientViewSet)
 
 # ==============================================================================
 # 🔗 URL 패턴 정의
@@ -41,6 +50,8 @@ urlpatterns = [
     # 1. 관리자 및 기본 인증
     path('admin/', admin.site.urls),
     path('api/login/', views.login_api, name='login'),
+
+    path('', include(router.urls)),
 
     # 2. 폰 연결 관련 (FCM 토큰 -> 기기 연결)
     path('api/agents/set-token/', views.update_fcm_token_view, name='set-fcm-token'),
@@ -73,6 +84,7 @@ urlpatterns = [
     path('api/system/config/', views.SystemConfigView.as_view(), name='system_config'),
 
     # 7. Router 등록 API 일괄 적용 (맨 마지막에 배치)
+    # router.register로 등록한 모든 경로가 여기로 연결됩니다.
     path('api/', include(router.urls)),
 ]
 

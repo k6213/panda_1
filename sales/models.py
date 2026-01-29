@@ -1,6 +1,7 @@
 from django.db import models
 from django.contrib.auth.models import AbstractUser
 from django.utils import timezone
+from django.conf import settings
 
 # ==============================================================================
 # 1. 사용자 (상담사/관리자) 모델
@@ -76,6 +77,9 @@ class Customer(models.Model):
     is_as_approved = models.BooleanField(default=False)
     detail_reason = models.CharField(max_length=100, blank=True, null=True)
     checklist = models.CharField(max_length=200, blank=True, default="")
+    client = models.CharField(max_length=50, blank=True, null=True, verbose_name="거래처")
+    settlement_memo = models.TextField(blank=True, null=True, verbose_name="정산 메모")
+    settlement_complete_date = models.DateField(null=True, blank=True, verbose_name="정산 완료일")
 
     # ⬇️ [핵심 추가] 관리자 확인 요청 기능용 필드
     request_status = models.CharField(
@@ -122,6 +126,7 @@ class SMSLog(models.Model):
     content = models.TextField(verbose_name="문자 내용")
     direction = models.CharField(max_length=5, choices=DIRECTION_CHOICES, default='OUT', verbose_name="방향")
     status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='PENDING', verbose_name="상태")
+    image = models.ImageField(upload_to='sms_images/', null=True, blank=True)
     
     sent_at = models.DateTimeField(auto_now_add=True, verbose_name="발송 시간")
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="생성 시간")
@@ -172,3 +177,31 @@ class PolicyImage(models.Model):
 
     def __str__(self):
         return f"{self.platform} 정책 ({self.updated_at})"
+
+
+class TodoTask(models.Model):
+    sender = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='sent_tasks') # 지시한 사람 (관리자)
+    assigned_to = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, null=True, blank=True, related_name='assigned_tasks') # 담당 직원 (null이면 전체)
+    content = models.TextField() # 지시 내용
+    is_global = models.BooleanField(default=False) # 전체 공지 여부
+    is_completed = models.BooleanField(default=False) # 완료 여부 (개인별 처리 필요 시 ManyToMany로 확장 필요)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.sender} -> {self.content}"
+
+
+class CancelReason(models.Model):
+    """접수 취소 사유 관리"""
+    reason = models.CharField(max_length=100)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return self.reason
+
+class Client(models.Model):
+    name = models.CharField(max_length=50, unique=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return self.name
