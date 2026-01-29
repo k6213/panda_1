@@ -150,42 +150,54 @@ def update_fcm_token_view(request):
 # 2. SMS 및 고객 유입
 # ==============================================================================
 
+# sales/views.py 내의 SMSReceiveView 클래스 수정
+
 class SMSReceiveView(APIView):
     permission_classes = [AllowAny] 
+
     def post(self, request):
         data = request.data
+        print(f"📥 웹훅 수신 데이터: {data}") # 디버깅용 로그
+
+        # 🟢 공식 문서 규격에 맞게 데이터 추출
         if 'payload' in data:
-            payload = data['payload']
+            # 웹훅 등록 방식으로 올 경우
+            payload = data.get('payload', {})
             from_num = payload.get('phoneNumber')
             msg_content = payload.get('message')
         else:
+            # 그 외 일반적인 전송 방식일 경우 (예비용)
             from_num = data.get('from') or data.get('sender')
-            msg_content = data.get('message') or data.get('text') or data.get('content')
+            msg_content = data.get('message') or data.get('text')
 
         if not from_num or not msg_content:
-            return Response({"message": "데이터 부족"}, status=400)
+            return Response({"message": "데이터가 부족합니다."}, status=400)
 
-        if SMSLog.objects.filter(content=msg_content, direction='IN', created_at__gte=timezone.now() - datetime.timedelta(seconds=10)).exists():
-            return Response({"status": "ignored", "message": "중복 메시지"}, status=200)
-
+        # 전화번호 정규화 (+8210... -> 010...)
         clean_num = clean_phone(from_num)
+        
+        # 번호 뒷 8자리가 일치하는 고객 찾기
         customer = Customer.objects.filter(phone__contains=clean_num[-8:]).first()
         
-        if not customer:
-            customer = Customer.objects.create(
-                phone=clean_num,
-                name=f"신규문의({clean_num[-4:]})",
-                status='미통건',
-                owner=None, 
-                upload_date=datetime.date.today()
+        if customer:
+            # 🟢 수신된 메시지를 DB에 저장 (IN 방향)
+            SMSLog.objects.create(
+                customer=customer, 
+                agent=customer.owner, 
+                content=msg_content, 
+                direction='IN', 
+                status='RECEIVED'
             )
-
-        SMSLog.objects.create(customer=customer, agent=customer.owner, content=msg_content, direction='IN', status='RECEIVED')
-        if customer.status == '부재':
-            customer.status = '재통'
-            customer.save()
-
-        return Response({"status": "success"}, status=200)
+            # 고객 상태가 '부재'였다면 '재통'으로 자동 변경 (선택사항)
+            if customer.status == '부재':
+                customer.status = '재통'
+                customer.save()
+            
+            print(f"✅ {customer.name}님의 답장 저장 완료!")
+            return Response({"status": "success"}, status=200)
+        else:
+            print(f"❓ 등록되지 않은 번호의 문자: {clean_num}")
+            return Response({"status": "ignored", "message": "등록되지 않은 고객입니다."}, status=200)
 
 class LeadCaptureView(APIView):
     permission_classes = [AllowAny] 
