@@ -46,24 +46,72 @@ def clean_phone(phone):
 # ==============================================================================
 # [핵심] 문자 발송 함수
 # ==============================================================================
-def send_traccar_cloud_sms(phone, sms_text):
-    phone_ip = "192.168.35.2"
-    port = "8080"
-    username = "sms"
-    password = "YmPQD1pa"
-    url = f"http://{phone_ip}:{port}/message"
-    payload = { "phoneNumbers": [phone], "message": sms_text }
+# views.py 수정
+# views.py 수정
+def send_traccar_cloud_sms(phone, sms_text, gateway_config):
+    url = gateway_config.get('url')
+    username = gateway_config.get('username')
+    password = gateway_config.get('password')
 
-    try:
-        response = requests.post(url, json=payload, auth=HTTPBasicAuth(username, password), timeout=3)
-        if response.status_code in [200, 201, 202]:
-            return True
-        else:
-            return False
-    except Exception as e:
-        print(f"❌ 연결 실패: {e}")
+    if not all([url, username, password]):
         return False
 
+    # 📱 [중요] 전화번호를 +8210... 형식으로 변환
+    # 모든 특수문자 제거
+    raw_num = re.sub(r'[^0-9]', '', str(phone))
+    if raw_num.startswith('0'):
+        # 앞의 0을 제거하고 +82를 붙임 (01012345678 -> +821012345678)
+        formatted_phone = '+82' + raw_num[1:]
+    elif raw_num.startswith('82'):
+        formatted_phone = '+' + raw_num
+    else:
+        formatted_phone = '+82' + raw_num
+
+    payload = {
+        "textMessage": {
+            "text": sms_text
+        },
+        "phoneNumbers": [formatted_phone] # 👈 변환된 번호 사용
+    }
+
+    try:
+        response = requests.post(
+            url, 
+            json=payload, 
+            auth=HTTPBasicAuth(username, password), 
+            timeout=5
+        )
+        
+        if response.status_code in [200, 201, 202]:
+            print(f"✅ 발송 성공: {formatted_phone}")
+            return True
+        else:
+            # 400 에러 메시지를 로그에 더 자세히 출력
+            print(f"❌ 발송 실패: {response.status_code} - {response.text}")
+            return False
+    except Exception as e:
+        print(f"❌ 연결 오류: {e}")
+        return False
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def test_sms_connection(request):
+    # 1. 리액트가 보낸 데이터(번호, 설정값)를 꺼냄
+    phone = request.data.get('phone')
+    gateway_config = request.data.get('gateway_config') # 리액트의 smsConfig 객체
+
+    if not phone or not gateway_config:
+        return Response({"message": "번호나 설정값이 없습니다."}, status=400)
+
+    # 2. 위에서 만든 '엔진' 함수를 실행
+    test_msg = "[연동테스트] 서버와 휴대폰이 연결되었습니다."
+    success = send_traccar_cloud_sms(clean_phone(phone), test_msg, gateway_config)
+
+    # 3. 결과에 따라 리액트에 응답을 보냄
+    if success:
+        return Response({"message": "테스트 문자 발송 성공!"})
+    else:
+        return Response({"message": "발송 실패! 설정값을 확인하세요."}, status=500)
 # ==============================================================================
 # 1. 인증 및 기기 연결
 # ==============================================================================
@@ -168,45 +216,50 @@ class LeadCaptureView(APIView):
         
         return Response({"message": "고객 등록 완료", "customer_id": customer.id}, status=201)
 
+# views.py 내의 send_manual_sms 함수 수정
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def send_manual_sms(request):
     customer_id = request.data.get('customer_id')
-    sms_text = request.data.get('message', '').strip() # 공백 제거
-    image_file = request.FILES.get('image') # 🟢 [추가] 프론트에서 보낸 파일 수신
+    sms_text = request.data.get('message', '').strip()
+    image_file = request.FILES.get('image')
     
+    # 🟢 [추가] 프론트엔드에서 보낸 기기 설정값 받기
+    # FormData(MultiPart)로 데이터가 오므로 문자열 형태를 JSON으로 파싱해야 합니다.
+    gateway_config_raw = request.data.get('gateway_config')
+    try:
+        gateway_config = json.loads(gateway_config_raw) if gateway_config_raw else None
+    except:
+        gateway_config = gateway_config_raw # 이미 객체인 경우
+
     agent = request.user
     customer = get_object_or_404(Customer, id=customer_id)
 
-    # 1. 텍스트가 없고 이미지도 없으면 에러
     if not sms_text and not image_file:
         return Response({"message": "내용 또는 이미지가 필요합니다."}, status=400)
 
-    # 2. 텍스트가 비어있는데 이미지가 있다면 대체 텍스트 설정 (DB 에러 방지)
+    if not gateway_config:
+        return Response({"message": "문자 발송 기기 설정 정보가 없습니다."}, status=400)
+
     if not sms_text and image_file:
         sms_text = "(사진 첨부)"
 
-    # 3. 로그 생성 (이미지 포함)
     log = SMSLog.objects.create(
         customer=customer, 
         agent=agent, 
         content=sms_text, 
-        image=image_file,  # 🟢 [추가] DB에 이미지 파일 저장
+        image=image_file,
         direction='OUT', 
         status='PENDING'
     )
 
-    # 4. 문자 발송 (Traccar는 텍스트만 전송)
-    # (참고: 실제 이미지를 MMS로 보내려면 게이트웨이가 지원해야 함. 
-    #  여기서는 DB에 저장하고, 상대방에겐 텍스트 알림이 가는 구조입니다.)
-    if send_traccar_cloud_sms(clean_phone(customer.phone), sms_text):
-        log.status = 'SUCCESS'
-        log.save()
+    # 🔴 [수정] 3번째 인자로 gateway_config를 전달합니다.
+    if send_traccar_cloud_sms(customer.phone, sms_text, gateway_config):
+        log.status = 'SUCCESS'; log.save()
         return Response({"message": "전송 성공", "log_id": log.id}, status=200)
     else:
-        log.status = 'FAIL'
-        log.save()
-        return Response({"message": "발송 실패 (앱 연결 확인 필요)", "log_id": log.id}, status=200)
+        log.status = 'FAIL'; log.save()
+        return Response({"message": "발송 실패 (기기 연결 확인)", "log_id": log.id}, status=200)
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])

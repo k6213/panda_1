@@ -67,6 +67,8 @@ urlpatterns = [
     # [수신] 앱이 문자를 받았을 때 (Webhook)
     path('api/sms/receive/', views.SMSReceiveView.as_view(), name='sms_receive'),
 
+    path('api/sms/test_connection/', views.test_sms_connection),
+
     # [발신] 채팅창에서 수동 전송
     path('api/sales/manual-sms/', views.send_manual_sms, name='send_manual_sms'),
 
