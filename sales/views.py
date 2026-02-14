@@ -560,18 +560,109 @@ class CustomerViewSet(viewsets.ModelViewSet):
         
         return Response(serializer.data)
 
+    @action(detail=False, methods=['post'])
+    def start_chat(self, request):
+        """
+        📱 번호를 입력받아 채팅방을 조회하거나 새로 생성함
+        """
+        raw_phone = request.data.get('phone')
+        phone = clean_phone(raw_phone) # 하이픈 제거 및 정규화
+        
+        if not phone or len(phone) < 10:
+            return Response({"message": "유효한 전화번호를 입력해주세요."}, status=400)
+
+        # 1. 기존 고객이 있는지 확인 (전체 DB 기준)
+        customer = Customer.objects.filter(phone=phone).first()
+
+        if customer:
+            # 2-1. 이미 있다면: 담당자 확인
+            if not customer.owner:
+                # 담당자가 없다면 나에게 배정
+                customer.owner = request.user
+                customer.save()
+                message = "미배정 DB를 나에게 배정하고 채팅방을 열었습니다."
+            elif customer.owner == request.user:
+                message = "기존 상담중인 채팅방을 열었습니다."
+            else:
+                # 다른 사람의 담당인 경우 안내만 하고 정보 반환
+                return Response({
+                    "message": f"이미 {customer.owner.username}님이 상담 중인 번호입니다.",
+                    "customer": CustomerSerializer(customer).data,
+                    "is_other_owner": True
+                }, status=200)
+        else:
+            # 2-2. 없다면: 새로 생성하고 나에게 배정
+            customer = Customer.objects.create(
+                phone=phone,
+                name=request.data.get('name', f"신규_{phone[-4:]}"),
+                owner=request.user,
+                status='미통건',
+                platform='기타',
+                upload_date=datetime.date.today(),
+                last_memo="채팅 검색을 통해 새 방이 생성되었습니다."
+            )
+            # 로그 생성
+            ConsultationLog.objects.create(
+                customer=customer,
+                writer=request.user,
+                content="[시스템] 신규 번호 입력을 통해 채팅방 개설"
+            )
+            message = "새로운 채팅방이 생성되었습니다."
+
+        serializer = self.get_serializer(customer)
+        return Response({
+            "message": message,
+            "customer": serializer.data
+        }, status=200)
+        
+
 class NoticeViewSet(viewsets.ModelViewSet):
     queryset = Notice.objects.all().order_by('-is_important', '-created_at'); serializer_class = NoticeSerializer; permission_classes = [IsAuthenticated]
     def perform_create(self, serializer): serializer.save(writer=self.request.user)
+
 class PolicyImageViewSet(viewsets.ModelViewSet):
-    queryset = PolicyImage.objects.all(); serializer_class = PolicyImageSerializer; permission_classes = [IsAuthenticated]; parser_classes = (MultiPartParser, FormParser)
+    queryset = PolicyImage.objects.all()
+    serializer_class = PolicyImageSerializer
+    permission_classes = [IsAuthenticated] # 필요시 주석 해제
+
+    # sales/views.py 파일의 해당 부분
+
     @action(detail=False, methods=['get'])
     def latest(self, request):
         data = {}
-        for p in ['KT', 'SK', 'LG', 'Sky']:
-            img = PolicyImage.objects.filter(platform=p).order_by('-updated_at').first()
-            if img: data[p] = request.build_absolute_uri(img.image.url)
+        platforms = PolicyImage.objects.values_list('platform', flat=True).distinct()
+        
+        for p in platforms:
+            images = PolicyImage.objects.filter(platform=p).order_by('-updated_at')
+            data[p] = [
+                {
+                    "id": img.id, 
+                    "url": request.build_absolute_uri(img.image.url) if img.image else None
+                } 
+                for img in images if img.image
+            ]
         return Response(data)
+
+    # 📤 [업로드] 여러 장의 이미지를 한 번에 저장
+    def create(self, request, *args, **kwargs):
+        platform = request.data.get('platform')
+        images = request.FILES.getlist('image')
+
+        if not images:
+            return Response({"message": "업로드할 이미지가 없습니다."}, status=status.HTTP_400_BAD_REQUEST)
+
+        created_count = 0
+        for img in images:
+            PolicyImage.objects.create(
+                platform=platform,
+                image=img
+            )
+            created_count += 1
+
+        return Response({
+            "message": f"{created_count}장의 이미지가 성공적으로 업로드되었습니다.",
+            "status": "success"
+        }, status=status.HTTP_201_CREATED)
 
 class PlatformViewSet(viewsets.ModelViewSet): queryset = Platform.objects.all(); serializer_class = PlatformSerializer; permission_classes = [IsAuthenticated]
 class FailureReasonViewSet(viewsets.ModelViewSet): queryset = FailureReason.objects.all(); serializer_class = ReasonSerializer; permission_classes = [IsAuthenticated]

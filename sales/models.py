@@ -2,6 +2,10 @@ from django.db import models
 from django.contrib.auth.models import AbstractUser
 from django.utils import timezone
 from django.conf import settings
+import os
+from django.db.models.signals import post_delete
+from django.dispatch import receiver
+
 
 # ==============================================================================
 # 1. 사용자 (상담사/관리자) 모델
@@ -205,3 +209,15 @@ class Client(models.Model):
 
     def __str__(self):
         return self.name
+
+
+@receiver(post_delete, sender=PolicyImage)
+def auto_delete_file_on_delete(sender, instance, **kwargs):
+    """
+    PolicyImage 모델 데이터가 삭제될 때, 
+    서버의 'media/policy_images/' 폴더 내 실제 파일도 삭제합니다.
+    """
+    if instance.image:
+        if os.path.isfile(instance.image.path):
+            os.remove(instance.image.path)
+            print(f"✅ 파일 삭제 완료: {instance.image.path}")
