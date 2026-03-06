@@ -98,6 +98,7 @@ CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
     "https://panda-2-lupm.vercel.app",
+    "https://panda-2-lupm-git-main-kanghos-projects-dd73d55a.vercel.app",
 ]
 
 CSRF_TRUSTED_ORIGINS = [
