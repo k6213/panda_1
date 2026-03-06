@@ -5,6 +5,8 @@ from django.conf.urls.static import static
 from rest_framework.routers import DefaultRouter
 from sales import views  
 
+if settings.DEBUG: # 배포 환경에서도 테스트를 위해 일단 열어둘 수 있습니다.
+    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
 # ==============================================================================
 # 🔄 Router 설정
 # ==============================================================================

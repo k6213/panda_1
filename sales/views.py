@@ -48,7 +48,13 @@ def clean_phone(phone):
 # ==============================================================================
 # views.py 수정
 # views.py 수정
-def send_traccar_cloud_sms(phone, sms_text, gateway_config):
+    {     "textMessage": {
+            "text": sms_text
+        },
+        "phoneNumbers": [formatted_phone] # 👈 변환된 번호 사용
+    }
+    # [수정된 부분] send_traccar_cloud_sms 함수
+def send_traccar_cloud_sms(phone, sms_text, gateway_config, image_url=None):
     url = gateway_config.get('url')
     username = gateway_config.get('username')
     password = gateway_config.get('password')
@@ -56,37 +62,33 @@ def send_traccar_cloud_sms(phone, sms_text, gateway_config):
     if not all([url, username, password]):
         return False
 
-    # 📱 [중요] 전화번호를 +8210... 형식으로 변환
-    # 모든 특수문자 제거
     raw_num = re.sub(r'[^0-9]', '', str(phone))
-    if raw_num.startswith('0'):
-        # 앞의 0을 제거하고 +82를 붙임 (01012345678 -> +821012345678)
-        formatted_phone = '+82' + raw_num[1:]
-    elif raw_num.startswith('82'):
-        formatted_phone = '+' + raw_num
-    else:
-        formatted_phone = '+82' + raw_num
+    formatted_phone = '+82' + raw_num[1:] if raw_num.startswith('0') else '+82' + raw_num
 
+    # 📱 기본 페이로드
     payload = {
         "textMessage": {
             "text": sms_text
         },
-        "phoneNumbers": [formatted_phone] # 👈 변환된 번호 사용
+        "phoneNumbers": [formatted_phone]
     }
+
+    # 🖼️ 이미지가 있을 경우 앱 규격에 따라 필드 추가
+    # 대부분의 안드로이드 게이트웨이는 'media' 필드에 URL을 담아 보냅니다.
+    if image_url:
+        payload["media"] = [{"url": image_url}] 
 
     try:
         response = requests.post(
             url, 
             json=payload, 
             auth=HTTPBasicAuth(username, password), 
-            timeout=5
+            timeout=10
         )
         
         if response.status_code in [200, 201, 202]:
-            print(f"✅ 발송 성공: {formatted_phone}")
             return True
         else:
-            # 400 에러 메시지를 로그에 더 자세히 출력
             print(f"❌ 발송 실패: {response.status_code} - {response.text}")
             return False
     except Exception as e:
@@ -228,7 +230,7 @@ class LeadCaptureView(APIView):
         
         return Response({"message": "고객 등록 완료", "customer_id": customer.id}, status=201)
 
-# views.py 내의 send_manual_sms 함수 수정
+# [수정된 부분] send_manual_sms 함수
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def send_manual_sms(request):
@@ -236,13 +238,11 @@ def send_manual_sms(request):
     sms_text = request.data.get('message', '').strip()
     image_file = request.FILES.get('image')
     
-    # 🟢 [추가] 프론트엔드에서 보낸 기기 설정값 받기
-    # FormData(MultiPart)로 데이터가 오므로 문자열 형태를 JSON으로 파싱해야 합니다.
     gateway_config_raw = request.data.get('gateway_config')
     try:
         gateway_config = json.loads(gateway_config_raw) if gateway_config_raw else None
     except:
-        gateway_config = gateway_config_raw # 이미 객체인 경우
+        gateway_config = gateway_config_raw
 
     agent = request.user
     customer = get_object_or_404(Customer, id=customer_id)
@@ -250,23 +250,30 @@ def send_manual_sms(request):
     if not sms_text and not image_file:
         return Response({"message": "내용 또는 이미지가 필요합니다."}, status=400)
 
-    if not gateway_config:
-        return Response({"message": "문자 발송 기기 설정 정보가 없습니다."}, status=400)
-
-    if not sms_text and image_file:
-        sms_text = "(사진 첨부)"
-
+    # 로그 생성 (이미지 포함)
     log = SMSLog.objects.create(
         customer=customer, 
         agent=agent, 
-        content=sms_text, 
+        content=sms_text if sms_text else "(사진 첨부)", 
         image=image_file,
         direction='OUT', 
         status='PENDING'
     )
 
-    # 🔴 [수정] 3번째 인자로 gateway_config를 전달합니다.
-    if send_traccar_cloud_sms(customer.phone, sms_text, gateway_config):
+    # 🖼️ [핵심 추가] 이미지 URL 생성
+    image_url = None
+    if log.image:
+        # 서버의 절대 주소를 포함한 URL 생성 (예: http://1.2.3.4:8000/media/...)
+        image_url = image_url.replace("http://127.0.0.1:8000", "https://panda-1-hd18.onrender.com")
+        
+        # 만약 앱에서 MMS를 직접 지원하지 않는 경우를 대비해 텍스트 뒤에 링크를 붙여줌
+        if not sms_text:
+            sms_text = f"[사진 첨부] {image_url}"
+        else:
+            sms_text += f"\n[이미지] {image_url}"
+
+    # 🔴 [수정] 4번째 인자로 image_url을 전달
+    if send_traccar_cloud_sms(customer.phone, sms_text, gateway_config, image_url):
         log.status = 'SUCCESS'; log.save()
         return Response({"message": "전송 성공", "log_id": log.id}, status=200)
     else:
