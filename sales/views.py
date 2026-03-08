@@ -93,27 +93,33 @@ def clean_phone(phone):
 # 2. 문자 발송 엔진 (공식 문서 규격 100% 일치 버전)
 def send_traccar_cloud_sms(phone, sms_text, token, image_url=None):
     url = "https://www.traccar.org/sms/"
-    if not token: return False
+    
+    if not token:
+        print("❌ 토큰이 없습니다.")
+        return False
 
+    # 1. 전화번호 포맷팅
     raw_num = re.sub(r'[^0-9]', '', str(phone))
     formatted_phone = '+82' + raw_num[1:] if raw_num.startswith('0') else '+82' + raw_num
 
-    headers = {{
+    # 2. 인증 헤더 (중괄호 하나만 사용!)
+    headers = {
         "Authorization": token, 
         "Content-Type": "application/json"
-    }}
+    }
 
-    # 🚀 [중요] 공식 문서는 "to"를 리스트([])가 아닌 문자열("")로 요구합니다.
-    payload = {{
+    # 3. 데이터 구성 (중괄호 하나만 사용!)
+    payload = {
         "to": formatted_phone, 
         "message": sms_text
-    }}
+    }
 
     try:
         response = requests.post(url, json=payload, headers=headers, timeout=15)
-        print(f"📡 Traccar 결과: {{response.status_code}}")
+        print(f"📡 Traccar 요청 결과: {response.status_code}")
         return response.status_code in [200, 201, 202]
-    except:
+    except Exception as e:
+        print(f"❌ SMS 발송 중 예외 발생: {e}")
         return False
 
 @api_view(['POST'])
