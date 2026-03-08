@@ -180,52 +180,55 @@ def update_fcm_token_view(request):
 
 # sales/views.py 내의 SMSReceiveView 클래스 수정
 
+# views.py 내의 SMSReceiveView 클래스 수정
+
 class SMSReceiveView(APIView):
     permission_classes = [AllowAny] 
+    # 사진 파일을 처리하기 위해 파서 추가
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def post(self, request):
         data = request.data
-        print(f"📥 웹훅 수신 데이터: {data}") # 디버깅용 로그
+        # 게이트웨이 앱에서 보낸 이미지 파일 확인
+        incoming_image = request.FILES.get('image') or request.FILES.get('file')
+        
+        print(f"📥 웹훅 수신 데이터: {data}") 
 
-        # 🟢 공식 문서 규격에 맞게 데이터 추출
+        # 1. 데이터 추출 (텍스트 및 번호)
         if 'payload' in data:
-            # 웹훅 등록 방식으로 올 경우
             payload = data.get('payload', {})
             from_num = payload.get('phoneNumber')
-            msg_content = payload.get('message')
+            msg_content = payload.get('message', '')
         else:
-            # 그 외 일반적인 전송 방식일 경우 (예비용)
             from_num = data.get('from') or data.get('sender')
-            msg_content = data.get('message') or data.get('text')
+            msg_content = data.get('message', '') or data.get('text', '')
 
-        if not from_num or not msg_content:
-            return Response({"message": "데이터가 부족합니다."}, status=400)
+        if not from_num:
+            return Response({"message": "발신 번호가 없습니다."}, status=400)
 
-        # 전화번호 정규화 (+8210... -> 010...)
         clean_num = clean_phone(from_num)
-        
-        # 번호 뒷 8자리가 일치하는 고객 찾기
         customer = Customer.objects.filter(phone__contains=clean_num[-8:]).first()
         
         if customer:
-            # 🟢 수신된 메시지를 DB에 저장 (IN 방향)
-            SMSLog.objects.create(
+            # 2. 📸 수신된 사진과 메시지를 DB에 저장
+            sms_log = SMSLog.objects.create(
                 customer=customer, 
                 agent=customer.owner, 
-                content=msg_content, 
-                direction='IN', 
+                content=msg_content if msg_content else "(사진 수신)", 
+                image=incoming_image, # 👈 여기에 고객이 보낸 사진이 저장됩니다.
+                direction='IN', # 수신
                 status='RECEIVED'
             )
-            # 고객 상태가 '부재'였다면 '재통'으로 자동 변경 (선택사항)
+            
+            # 부재중이었으면 상태 변경
             if customer.status == '부재':
                 customer.status = '재통'
                 customer.save()
             
-            print(f"✅ {customer.name}님의 답장 저장 완료!")
+            print(f"✅ {customer.name}님의 사진/답장 저장 완료! (Log ID: {sms_log.id})")
             return Response({"status": "success"}, status=200)
-        else:
-            print(f"❓ 등록되지 않은 번호의 문자: {clean_num}")
-            return Response({"status": "ignored", "message": "등록되지 않은 고객입니다."}, status=200)
+        
+        return Response({"status": "ignored"}, status=200)
 
 class LeadCaptureView(APIView):
     permission_classes = [AllowAny] 
@@ -346,16 +349,17 @@ def get_sms_history(request, customer_id):
     
     data = []
     for l in logs:
-        # 🟢 [추가] 이미지가 있으면 URL 생성, 없으면 None
         image_url = None
         if l.image:
-            image_url = request.build_absolute_uri(l.image.url)
+            # 상대 경로를 절대 경로로 변환 (Render 주소 적용)
+            raw_url = request.build_absolute_uri(l.image.url)
+            image_url = raw_url.replace("http://127.0.0.1:8000", "https://panda-1-hd18.onrender.com")
 
         data.append({
             'id': l.id,
-            'sender': 'me' if l.direction == 'OUT' else 'other',
+            'sender': 'me' if l.direction == 'OUT' else 'other', # 'other'가 고객
             'text': l.content,
-            'image': image_url, # 🟢 [추가] 프론트엔드로 이미지 주소 전달
+            'image': image_url, # 👈 수신된 사진 URL 포함
             'created_at': l.created_at.strftime("%Y-%m-%d %H:%M"),
             'status': l.status
         })
