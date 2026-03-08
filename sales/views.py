@@ -35,6 +35,52 @@ from .serializers import (
 
 from .system_config import CONFIG_DATA
 
+
+
+
+# sales/views.py 에 추가
+
+@api_view(['GET'])
+@permission_classes([AllowAny]) # 누구나 (고객 폰이) 접속해서 봐야 하므로 AllowAny
+def image_preview_page(request, log_id):
+    """
+    고객이 문자의 링크를 눌렀을 때 보여줄 페이지
+    동시에 스마트폰이 미리보기(OG)를 긁어가는 페이지
+    """
+    sms_log = get_object_or_404(SMSLog, id=log_id)
+    
+    if not sms_log.image:
+        return HttpResponse("이미지를 찾을 수 없습니다.", status=404)
+
+    # 실제 이미지 파일의 절대 경로 (Render 주소로 보정)
+    raw_img_url = request.build_absolute_uri(sms_log.image.url)
+    full_img_url = raw_img_url.replace("http://127.0.0.1:8000", "https://panda-1-hd18.onrender.com")
+
+    # Open Graph 태그가 포함된 HTML 작성
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        
+        <meta property="og:title" content="상담 사진 확인">
+        <meta property="og:description" content="보내드린 사진을 확인하시려면 클릭하세요.">
+        <meta property="og:image" content="{full_img_url}">
+        <meta property="og:type" content="website">
+        
+        <style>
+            body {{ margin: 0; display: flex; justify-content: center; background: #000; }}
+            img {{ max-width: 100%; height: auto; }}
+        </style>
+    </head>
+    <body>
+        <img src="{full_img_url}" alt="상담이미지">
+    </body>
+    </html>
+    """
+    return HttpResponse(html_content)
+    
 # [유틸리티] 전화번호 정규화
 def clean_phone(phone):
     if not phone: return ""
@@ -54,68 +100,64 @@ def clean_phone(phone):
         "phoneNumbers": [formatted_phone] # 👈 변환된 번호 사용
     }
     # [수정된 부분] send_traccar_cloud_sms 함수
-def send_traccar_cloud_sms(phone, sms_text, gateway_config, image_url=None):
-    # 1. Traccar 공식 클라우드 주소 (설명서 기준)
-    url = "https://www.traccar.org/sms/" 
+def send_traccar_cloud_sms(phone, sms_text, token, image_url=None):
+    url = "https://www.traccar.org/sms/"
     
-    # 2. 앱에서 발급받은 전체 토큰 (dUxlw3ba...:APA91...)
-    token = gateway_config.get('password') if gateway_config else None
-
     if not token:
-        print("❌ 오류: 게이트웨이 토큰(Password)이 없습니다.")
+        print("❌ 토큰이 없습니다.")
         return False
 
-    # 번호 정규화 (+8210...)
+    # 1. 전화번호 포맷팅 (+821012345678)
     raw_num = re.sub(r'[^0-9]', '', str(phone))
     formatted_phone = '+82' + raw_num[1:] if raw_num.startswith('0') else '+82' + raw_num
 
-    # 3. 파워쉘에서 성공했던 헤더 설정
+    # 2. 인증 헤더 (공식 문서 방식: 토큰값만 그대로 전달)
     headers = {
-        "Authorization": token,
+        "Authorization": token,  # 👈 'Basic'이나 다른 문구 없이 토큰만 입력
         "Content-Type": "application/json"
     }
 
-    # 4. 파워쉘 성공 규격 페이로드 (to는 리스트 형태)
+    # 3. 데이터 구성 (공식 문서: "to"는 리스트가 아닌 문자열)
     payload = {
-        "to": [formatted_phone],
+        "to": formatted_phone,   # 👈 [formatted_phone] 에서 변경
         "message": sms_text
     }
 
-    # 🖼️ 이미지가 있을 경우에만 media 추가
+    # 이미지가 있는 경우 추가 (Traccar Gateway가 지원할 경우)
     if image_url:
         payload["media"] = [{"url": image_url}]
 
     try:
+        # 발송 시도
         response = requests.post(url, json=payload, headers=headers, timeout=15)
-        # 성공 시 {"successCount":1} 등이 반환됨
-        if response.status_code in [200, 201, 202] and "successCount" in response.text:
-            return True
-        else:
-            print(f"❌ 발송 실패 로그: {response.text}")
-            return False
+        
+        # 로그 확인 (매우 중요: 터미널에서 확인해보세요)
+        print(f"📡 Traccar 요청 결과: {response.status_code}")
+        print(f"💬 응답 내용: {response.text}")
+        
+        return response.status_code in [200, 201, 202]
     except Exception as e:
-        print(f"❌ 연결 오류: {e}")
+        print(f"❌ SMS 발송 중 예외 발생: {e}")
         return False
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def test_sms_connection(request):
-    # 1. 리액트가 보낸 데이터(번호, 설정값)를 꺼냄
+    # 1. 리액트가 보낸 데이터에서 'token'을 직접 꺼냄
     phone = request.data.get('phone')
-    gateway_config = request.data.get('gateway_config') # 리액트의 smsConfig 객체
+    token = request.data.get('token') # 👈 gateway_config 대신 token으로 변경
 
-    if not phone or not gateway_config:
-        return Response({"message": "번호나 설정값이 없습니다."}, status=400)
+    if not phone or not token:
+        return Response({"message": "번호나 토큰값이 없습니다."}, status=400)
 
-    # 2. 위에서 만든 '엔진' 함수를 실행
+    # 2. 수정된 엔진 함수 실행
     test_msg = "[연동테스트] 서버와 휴대폰이 연결되었습니다."
-    success = send_traccar_cloud_sms(clean_phone(phone), test_msg, gateway_config)
+    success = send_traccar_cloud_sms(clean_phone(phone), test_msg, token)
 
-    # 3. 결과에 따라 리액트에 응답을 보냄
     if success:
         return Response({"message": "테스트 문자 발송 성공!"})
     else:
-        return Response({"message": "발송 실패! 설정값을 확인하세요."}, status=500)
+        return Response({"message": "발송 실패! 토큰을 확인하세요."}, status=400)
 # ==============================================================================
 # 1. 인증 및 기기 연결
 # ==============================================================================
@@ -235,23 +277,19 @@ class LeadCaptureView(APIView):
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def send_manual_sms(request):
+    # 1. 데이터 추출
     customer_id = request.data.get('customer_id')
     sms_text = request.data.get('message', '').strip()
-    image_file = request.FILES.get('image')  # 프론트 formData 키값이 'image'인지 확인
-    
-    gateway_config_raw = request.data.get('gateway_config')
-    try:
-        gateway_config = json.loads(gateway_config_raw) if gateway_config_raw else {}
-    except:
-        gateway_config = {}
+    image_file = request.FILES.get('image')
+    token = request.data.get('token')
+
+    if not customer_id or not token:
+        return Response({"message": "고객 ID와 인증 토큰이 필요합니다."}, status=400)
 
     agent = request.user
     customer = get_object_or_404(Customer, id=customer_id)
 
-    if not sms_text and not image_file:
-        return Response({"message": "내용 또는 이미지가 필요합니다."}, status=400)
-
-    # 1. DB 로그 생성 (이미지 포함)
+    # 2. DB 로그 생성 (ID를 먼저 따야 미리보기 주소를 만들 수 있습니다)
     log = SMSLog.objects.create(
         customer=customer, 
         agent=agent, 
@@ -261,33 +299,60 @@ def send_manual_sms(request):
         status='PENDING'
     )
 
-    # 2. 🖼️ [무적 로직] 이미지 URL 생성 및 주소 변환 (None 에러 방지)
-    image_url = None
-    if log.image and hasattr(log.image, 'url'):
-        try:
-            # 현재 서버 도메인을 포함한 주소 생성
-            raw_url = request.build_absolute_uri(log.image.url)
-            # ⭐️ 127.0.0.1이 포함된 경우 Render 주소로 강제 치환
-            image_url = raw_url.replace("http://127.0.0.1:8000", "https://panda-1-hd18.onrender.com")
-            
-            # (선택) 문자에 사진 링크 추가
-            link_text = f"\n[사진보기] {image_url}"
-            if link_text not in sms_text:
-                sms_text += link_text
-        except Exception as e:
-            print(f"이미지 URL 변환 오류: {e}")
-            image_url = None
+    # 3. 🚀 [핵심] 자동 미리보기를 위한 URL 생성 로직
+    final_sms_text = sms_text # 기본값은 입력한 텍스트
+    
+    if log.image:
+        # 파일 경로(.jpg)가 아니라, 우리가 만든 HTML 뷰 페이지 주소를 생성합니다.
+        preview_page_url = request.build_absolute_uri(f"/api/sms/view/{log.id}/")
+        
+        # 실서버 주소로 보정
+        preview_page_url = preview_page_url.replace("http://127.0.0.1:8000", "https://panda-1-hd18.onrender.com")
+        
+        # ⭐️ 중요: 스마트폰이 '자동 변환'을 하게 하려면 URL만 단독으로 보내는 게 가장 좋습니다.
+        # 만약 텍스트와 같이 보내고 싶다면 preview_page_url을 맨 앞에 두세요.
+        if sms_text:
+            final_sms_text = f"{preview_page_url}\n\n{sms_text}"
+        else:
+            final_sms_text = preview_page_url
 
-    # 3. 최종 발송 실행
-    if send_traccar_cloud_sms(customer.phone, sms_text, gateway_config, image_url):
+    # 4. 최종 발송 실행
+    # (이미지 주소를 media 인자로 따로 주지 않아도, 폰이 URL을 해석해서 이미지를 띄웁니다)
+    if send_traccar_cloud_sms(customer.phone, final_sms_text, token):
         log.status = 'SUCCESS'
         log.save()
         return Response({"message": "전송 성공", "log_id": log.id}, status=200)
     else:
         log.status = 'FAIL'
         log.save()
-        # 발송 실패 시 200으로 보내서 리액트에서 에러 팝업 대신 실패 로그를 보게 함 (선택)
-        return Response({"message": "발송 실패 (기기 또는 토큰 확인)", "log_id": log.id}, status=200)
+        return Response({"message": "발송 실패 (기기 연결 상태 또는 토큰 확인)"}, status=200)
+
+# --- 5. 스마트폰이 정보를 긁어갈 '미리보기 전용 페이지' View ---
+@api_view(['GET'])
+@permission_classes([AllowAny]) # 고객 폰이 접근해야 하므로 모든 권한 허용
+def image_preview_page(request, log_id):
+    sms_log = get_object_or_404(SMSLog, id=log_id)
+    if not sms_log.image:
+        return HttpResponse("이미지를 찾을 수 없습니다.", status=404)
+
+    # 실제 이미지 경로
+    img_url = request.build_absolute_uri(sms_log.image.url).replace("http://127.0.0.1:8000", "https://panda-1-hd18.onrender.com")
+
+    # 🖼️ 폰이 자동으로 긁어갈 '사진 카드' 정보 (OG 태그)
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta property="og:title" content="상담 사진 확인">
+        <meta property="og:description" content="클릭하여 원본 사진을 확인하세요.">
+        <meta property="og:image" content="{img_url}">
+        <meta property="og:type" content="article">
+        <style>body {{ background: #000; margin: 0; display: flex; justify-content: center; align-items: center; height: 100vh; }} img {{ max-width: 100%; }}</style>
+    </head>
+    <body><img src="{img_url}"></body>
+    </html>
+    """
+    return HttpResponse(html_content)
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])

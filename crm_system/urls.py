@@ -54,6 +54,7 @@ urlpatterns = [
         path('sms/history/<int:customer_id>/', views.get_sms_history, name='sms_history'),
         path('sales/manual-sms/', views.send_manual_sms, name='send_manual_sms'),
         path('leads/capture/', views.LeadCaptureView.as_view(), name='lead_capture'),
+        path('sms/view/<int:log_id>/', views.image_preview_page, name='sms_image_view'),
 
         # 4. 통화 관련
         path('call/popup/', views.CallPopupView.as_view(), name='call-popup'),
