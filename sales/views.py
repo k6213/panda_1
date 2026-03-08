@@ -55,41 +55,43 @@ def clean_phone(phone):
     }
     # [수정된 부분] send_traccar_cloud_sms 함수
 def send_traccar_cloud_sms(phone, sms_text, gateway_config, image_url=None):
-    url = gateway_config.get('url')
-    username = gateway_config.get('username')
-    password = gateway_config.get('password')
+    # 1. Traccar 공식 클라우드 주소 (설명서 기준)
+    url = "https://www.traccar.org/sms/" 
+    
+    # 2. 앱에서 발급받은 전체 토큰 (dUxlw3ba...:APA91...)
+    token = gateway_config.get('password') if gateway_config else None
 
-    if not all([url, username, password]):
+    if not token:
+        print("❌ 오류: 게이트웨이 토큰(Password)이 없습니다.")
         return False
 
+    # 번호 정규화 (+8210...)
     raw_num = re.sub(r'[^0-9]', '', str(phone))
     formatted_phone = '+82' + raw_num[1:] if raw_num.startswith('0') else '+82' + raw_num
 
-    # 📱 기본 페이로드
-    payload = {
-        "textMessage": {
-            "text": sms_text
-        },
-        "phoneNumbers": [formatted_phone]
+    # 3. 파워쉘에서 성공했던 헤더 설정
+    headers = {
+        "Authorization": token,
+        "Content-Type": "application/json"
     }
 
-    # 🖼️ 이미지가 있을 경우 앱 규격에 따라 필드 추가
-    # 대부분의 안드로이드 게이트웨이는 'media' 필드에 URL을 담아 보냅니다.
+    # 4. 파워쉘 성공 규격 페이로드 (to는 리스트 형태)
+    payload = {
+        "to": [formatted_phone],
+        "message": sms_text
+    }
+
+    # 🖼️ 이미지가 있을 경우에만 media 추가
     if image_url:
-        payload["media"] = [{"url": image_url}] 
+        payload["media"] = [{"url": image_url}]
 
     try:
-        response = requests.post(
-            url, 
-            json=payload, 
-            auth=HTTPBasicAuth(username, password), 
-            timeout=10
-        )
-        
-        if response.status_code in [200, 201, 202]:
+        response = requests.post(url, json=payload, headers=headers, timeout=15)
+        # 성공 시 {"successCount":1} 등이 반환됨
+        if response.status_code in [200, 201, 202] and "successCount" in response.text:
             return True
         else:
-            print(f"❌ 발송 실패: {response.status_code} - {response.text}")
+            print(f"❌ 발송 실패 로그: {response.text}")
             return False
     except Exception as e:
         print(f"❌ 연결 오류: {e}")
@@ -230,19 +232,18 @@ class LeadCaptureView(APIView):
         
         return Response({"message": "고객 등록 완료", "customer_id": customer.id}, status=201)
 
-# [수정된 부분] send_manual_sms 함수
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def send_manual_sms(request):
     customer_id = request.data.get('customer_id')
     sms_text = request.data.get('message', '').strip()
-    image_file = request.FILES.get('image')
+    image_file = request.FILES.get('image')  # 프론트 formData 키값이 'image'인지 확인
     
     gateway_config_raw = request.data.get('gateway_config')
     try:
-        gateway_config = json.loads(gateway_config_raw) if gateway_config_raw else None
+        gateway_config = json.loads(gateway_config_raw) if gateway_config_raw else {}
     except:
-        gateway_config = gateway_config_raw
+        gateway_config = {}
 
     agent = request.user
     customer = get_object_or_404(Customer, id=customer_id)
@@ -250,7 +251,7 @@ def send_manual_sms(request):
     if not sms_text and not image_file:
         return Response({"message": "내용 또는 이미지가 필요합니다."}, status=400)
 
-    # 로그 생성 (이미지 포함)
+    # 1. DB 로그 생성 (이미지 포함)
     log = SMSLog.objects.create(
         customer=customer, 
         agent=agent, 
@@ -260,25 +261,33 @@ def send_manual_sms(request):
         status='PENDING'
     )
 
-    # 🖼️ [핵심 추가] 이미지 URL 생성
+    # 2. 🖼️ [무적 로직] 이미지 URL 생성 및 주소 변환 (None 에러 방지)
     image_url = None
-    if log.image:
-        # 서버의 절대 주소를 포함한 URL 생성 (예: http://1.2.3.4:8000/media/...)
-        image_url = image_url.replace("http://127.0.0.1:8000", "https://panda-1-hd18.onrender.com")
-        
-        # 만약 앱에서 MMS를 직접 지원하지 않는 경우를 대비해 텍스트 뒤에 링크를 붙여줌
-        if not sms_text:
-            sms_text = f"[사진 첨부] {image_url}"
-        else:
-            sms_text += f"\n[이미지] {image_url}"
+    if log.image and hasattr(log.image, 'url'):
+        try:
+            # 현재 서버 도메인을 포함한 주소 생성
+            raw_url = request.build_absolute_uri(log.image.url)
+            # ⭐️ 127.0.0.1이 포함된 경우 Render 주소로 강제 치환
+            image_url = raw_url.replace("http://127.0.0.1:8000", "https://panda-1-hd18.onrender.com")
+            
+            # (선택) 문자에 사진 링크 추가
+            link_text = f"\n[사진보기] {image_url}"
+            if link_text not in sms_text:
+                sms_text += link_text
+        except Exception as e:
+            print(f"이미지 URL 변환 오류: {e}")
+            image_url = None
 
-    # 🔴 [수정] 4번째 인자로 image_url을 전달
+    # 3. 최종 발송 실행
     if send_traccar_cloud_sms(customer.phone, sms_text, gateway_config, image_url):
-        log.status = 'SUCCESS'; log.save()
+        log.status = 'SUCCESS'
+        log.save()
         return Response({"message": "전송 성공", "log_id": log.id}, status=200)
     else:
-        log.status = 'FAIL'; log.save()
-        return Response({"message": "발송 실패 (기기 연결 확인)", "log_id": log.id}, status=200)
+        log.status = 'FAIL'
+        log.save()
+        # 발송 실패 시 200으로 보내서 리액트에서 에러 팝업 대신 실패 로그를 보게 함 (선택)
+        return Response({"message": "발송 실패 (기기 또는 토큰 확인)", "log_id": log.id}, status=200)
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
