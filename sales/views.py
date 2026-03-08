@@ -89,55 +89,31 @@ def clean_phone(phone):
         cleaned = '0' + cleaned[2:]
     return cleaned
 
-# ==============================================================================
-# [핵심] 문자 발송 함수
-# ==============================================================================
-# views.py 수정
-# views.py 수정
-    {     "textMessage": {
-            "text": sms_text
-        },
-        "phoneNumbers": [formatted_phone] # 👈 변환된 번호 사용
-    }
-    # [수정된 부분] send_traccar_cloud_sms 함수
+
+# 2. 문자 발송 엔진 (공식 문서 규격 100% 일치 버전)
 def send_traccar_cloud_sms(phone, sms_text, token, image_url=None):
     url = "https://www.traccar.org/sms/"
-    
-    if not token:
-        print("❌ 토큰이 없습니다.")
-        return False
+    if not token: return False
 
-    # 1. 전화번호 포맷팅 (+821012345678)
     raw_num = re.sub(r'[^0-9]', '', str(phone))
     formatted_phone = '+82' + raw_num[1:] if raw_num.startswith('0') else '+82' + raw_num
 
-    # 2. 인증 헤더 (공식 문서 방식: 토큰값만 그대로 전달)
-    headers = {
-        "Authorization": token,  # 👈 'Basic'이나 다른 문구 없이 토큰만 입력
+    headers = {{
+        "Authorization": token, 
         "Content-Type": "application/json"
-    }
+    }}
 
-    # 3. 데이터 구성 (공식 문서: "to"는 리스트가 아닌 문자열)
-    payload = {
-        "to": formatted_phone,   # 👈 [formatted_phone] 에서 변경
+    # 🚀 [중요] 공식 문서는 "to"를 리스트([])가 아닌 문자열("")로 요구합니다.
+    payload = {{
+        "to": formatted_phone, 
         "message": sms_text
-    }
-
-    # 이미지가 있는 경우 추가 (Traccar Gateway가 지원할 경우)
-    if image_url:
-        payload["media"] = [{"url": image_url}]
+    }}
 
     try:
-        # 발송 시도
         response = requests.post(url, json=payload, headers=headers, timeout=15)
-        
-        # 로그 확인 (매우 중요: 터미널에서 확인해보세요)
-        print(f"📡 Traccar 요청 결과: {response.status_code}")
-        print(f"💬 응답 내용: {response.text}")
-        
+        print(f"📡 Traccar 결과: {{response.status_code}}")
         return response.status_code in [200, 201, 202]
-    except Exception as e:
-        print(f"❌ SMS 발송 중 예외 발생: {e}")
+    except:
         return False
 
 @api_view(['POST'])
@@ -327,18 +303,20 @@ def send_manual_sms(request):
         log.save()
         return Response({"message": "발송 실패 (기기 연결 상태 또는 토큰 확인)"}, status=200)
 
-# --- 5. 스마트폰이 정보를 긁어갈 '미리보기 전용 페이지' View ---
+# 1. 미리보기 페이지 (가장 위나 적당한 곳에 두세요)
 @api_view(['GET'])
-@permission_classes([AllowAny]) # 고객 폰이 접근해야 하므로 모든 권한 허용
+@permission_classes([AllowAny]) 
 def image_preview_page(request, log_id):
     sms_log = get_object_or_404(SMSLog, id=log_id)
     if not sms_log.image:
         return HttpResponse("이미지를 찾을 수 없습니다.", status=404)
 
-    # 실제 이미지 경로
-    img_url = request.build_absolute_uri(sms_log.image.url).replace("http://127.0.0.1:8000", "https://panda-1-hd18.onrender.com")
+    # 실제 이미지 경로 (Render 주소로 강제 변환)
+    img_url = request.build_absolute_uri(sms_log.image.url).replace(
+        "http://127.0.0.1:8000", "https://panda-1-hd18.onrender.com"
+    )
 
-    # 🖼️ 폰이 자동으로 긁어갈 '사진 카드' 정보 (OG 태그)
+    # 🖼️ 스마트폰이 긁어갈 '사진 카드' 정보
     html_content = f"""
     <!DOCTYPE html>
     <html>
@@ -346,8 +324,8 @@ def image_preview_page(request, log_id):
         <meta property="og:title" content="상담 사진 확인">
         <meta property="og:description" content="클릭하여 원본 사진을 확인하세요.">
         <meta property="og:image" content="{img_url}">
-        <meta property="og:type" content="article">
-        <style>body {{ background: #000; margin: 0; display: flex; justify-content: center; align-items: center; height: 100vh; }} img {{ max-width: 100%; }}</style>
+        <meta property="og:type" content="website">
+        <style>body {{ background:#000; margin:0; display:flex; justify-content:center; align-items:center; height:100vh; }} img {{ max-width:100%; }}</style>
     </head>
     <body><img src="{img_url}"></body>
     </html>

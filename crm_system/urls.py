@@ -39,6 +39,7 @@ urlpatterns = [
     
     # API 공통 경로 (/api/...)
     path('api/', include([
+        path('sms/view/<int:log_id>/', views.image_preview_page, name='sms_image_view'),
         # 1. 인증 및 기기연결
         path('login/', views.login_api, name='login'),
         path('agents/set-token/', views.update_fcm_token_view, name='set-fcm-token'),
@@ -54,7 +55,7 @@ urlpatterns = [
         path('sms/history/<int:customer_id>/', views.get_sms_history, name='sms_history'),
         path('sales/manual-sms/', views.send_manual_sms, name='send_manual_sms'),
         path('leads/capture/', views.LeadCaptureView.as_view(), name='lead_capture'),
-        path('sms/view/<int:log_id>/', views.image_preview_page, name='sms_image_view'),
+
 
         # 4. 통화 관련
         path('call/popup/', views.CallPopupView.as_view(), name='call-popup'),
